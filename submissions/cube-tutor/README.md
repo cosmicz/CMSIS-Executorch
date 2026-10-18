@@ -24,6 +24,9 @@ laptop was used for training, flashing and inspecting intermediate buffers.
 
 ## Source
 
+Public project repository: [cosmicz/alif-cube-tutor](https://github.com/cosmicz/alif-cube-tutor).
+It contains the full firmware source, upstream history and project README.
+
 [`cube-tutor.patch`](cube-tutor.patch) contains the firmware changes and host
 regression tests, relative to [npow/alif-mlek-yolo at
 `bbc9f4f`](https://github.com/npow/alif-mlek-yolo/tree/bbc9f4f164b89b7a29ef84bd99f0d56917dc7225).
