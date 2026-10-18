@@ -1,3 +1,8 @@
+# Hackathon submission: Cube Tutor
+
+See [Cube Tutor — how it works and source changes](submissions/cube-tutor/README.md)
+for our Alif E8 camera-based cube tutor. The original starter guide follows.
+
 # pico-faces on Ethos-U85 with ExecuTorch: hackathon guide
 
 The Arm ExecuTorch example, on its `hackathon` branch: a generative model on

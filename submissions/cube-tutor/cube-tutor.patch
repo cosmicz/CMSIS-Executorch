@@ -1,0 +1,2155 @@
+diff --git a/scripts/cmake/platforms/alif/AE822FA0E5597/rtss_hp/RTSS-HP.ld b/scripts/cmake/platforms/alif/AE822FA0E5597/rtss_hp/RTSS-HP.ld
+index 8aa35113..c41817c5 100644
+--- a/scripts/cmake/platforms/alif/AE822FA0E5597/rtss_hp/RTSS-HP.ld
++++ b/scripts/cmake/platforms/alif/AE822FA0E5597/rtss_hp/RTSS-HP.ld
+@@ -35,7 +35,9 @@ __STACK_SIZE = 0x00008000;
+ __HEAP_SIZE  = 0x00017000;
+ /* DevKit E8 app image starts at the same MRAM boot address as the CMSIS app. */
+ __ROM_BASE = 0x80200000;
+-__ROM_SIZE = 0x00477000;
++/* Physical AppKit-E8 MRAM ends at 0x80580000.  Do not permit a link that
++ * relies on the larger generic DFP window. */
++__ROM_SIZE = 0x00380000;
+ 
+ #ifdef BOARD_OSPI_FLASH_BASE
+ __OSPI_FLASH_BASE = BOARD_OSPI_FLASH_BASE;
+diff --git a/source/app/use_case/alif_object_detection/include/CubeFaceMultiSelect.hpp b/source/app/use_case/alif_object_detection/include/CubeFaceMultiSelect.hpp
+new file mode 100644
+index 00000000..6b2b5664
+--- /dev/null
++++ b/source/app/use_case/alif_object_detection/include/CubeFaceMultiSelect.hpp
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef CUBE_FACE_MULTI_SELECT_HPP
++#define CUBE_FACE_MULTI_SELECT_HPP
++
++#include <algorithm>
++#include <cstddef>
++
++namespace alif::app::object_detection {
++
++/* One to three cube faces per image (arc-fdo1, 2026-10-18).  valueAt reads the
++ * channel-major YOLOv8 output [x, y, width, height, confidence] in normalised
++ * units.  Candidates below confidenceThreshold or smaller than minArea (single
++ * stickers) are dropped; greedy non-maximum suppression by confidence removes
++ * overlaps above iouThreshold; the survivors are returned largest first, at
++ * most maxFaces of them.  Returns how many indices were written to selected. */
++template <typename ValueAt>
++size_t SelectCubeFaces(ValueAt valueAt, size_t candidates, float confidenceThreshold, float minArea,
++                       float iouThreshold, size_t maxFaces, size_t* selected)
++{
++    const auto confidence = [&](size_t c) { return valueAt(4 * candidates + c); };
++    const auto width  = [&](size_t c) { return std::max(0.0f, valueAt(2 * candidates + c)); };
++    const auto height = [&](size_t c) { return std::max(0.0f, valueAt(3 * candidates + c)); };
++    const auto area   = [&](size_t c) { return width(c) * height(c); };
++    const auto iou = [&](size_t a, size_t b) {
++        const float ax0 = valueAt(a) - width(a) / 2, ax1 = valueAt(a) + width(a) / 2;
++        const float ay0 = valueAt(candidates + a) - height(a) / 2, ay1 = valueAt(candidates + a) + height(a) / 2;
++        const float bx0 = valueAt(b) - width(b) / 2, bx1 = valueAt(b) + width(b) / 2;
++        const float by0 = valueAt(candidates + b) - height(b) / 2, by1 = valueAt(candidates + b) + height(b) / 2;
++        const float iw = std::max(0.0f, std::min(ax1, bx1) - std::max(ax0, bx0));
++        const float ih = std::max(0.0f, std::min(ay1, by1) - std::max(ay0, by0));
++        const float inter = iw * ih;
++        const float uni = area(a) + area(b) - inter;
++        return uni > 0.0f ? inter / uni : 0.0f;
++    };
++    size_t survivors[16];
++    size_t count = 0;
++    bool done[756] = {};
++    if (candidates > sizeof(done) / sizeof(done[0]) || maxFaces == 0 || !selected) {
++        return 0;
++    }
++    for (;;) {
++        size_t best = candidates;
++        float bestConfidence = confidenceThreshold;
++        for (size_t c = 0; c < candidates; ++c) {
++            if (done[c]) continue;
++            const float conf = confidence(c);
++            if (conf <= confidenceThreshold || area(c) < minArea) { done[c] = true; continue; }
++            if (conf > bestConfidence) { best = c; bestConfidence = conf; }
++        }
++        if (best == candidates) break;
++        done[best] = true;
++        bool suppressed = false;
++        for (size_t i = 0; i < count; ++i) {
++            if (iou(best, survivors[i]) > iouThreshold) { suppressed = true; break; }
++        }
++        if (suppressed) continue;
++        survivors[count++] = best;
++        if (count == sizeof(survivors) / sizeof(survivors[0])) break;
++    }
++    std::sort(survivors, survivors + count, [&](size_t a, size_t b) { return area(a) > area(b); });
++    const size_t kept = std::min(count, maxFaces);
++    for (size_t i = 0; i < kept; ++i) selected[i] = survivors[i];
++    return kept;
++}
++
++} /* namespace alif::app::object_detection */
++
++#endif /* CUBE_FACE_MULTI_SELECT_HPP */
+diff --git a/source/app/use_case/alif_object_detection/include/CubeFaceYoloV8.hpp b/source/app/use_case/alif_object_detection/include/CubeFaceYoloV8.hpp
+new file mode 100644
+index 00000000..5408d077
+--- /dev/null
++++ b/source/app/use_case/alif_object_detection/include/CubeFaceYoloV8.hpp
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: Apache-2.0 */
++#ifndef CUBE_FACE_YOLO_V8_HPP
++#define CUBE_FACE_YOLO_V8_HPP
++
++#include <algorithm>
++#include <cstddef>
++
++namespace alif::app::object_detection {
++
++/* Prefer the largest plausible face over a high-confidence single sticker.
++ * valueAt is a channel-major YOLOv8 [x, y, width, height, confidence] reader. */
++template <typename ValueAt>
++size_t SelectLargestFaceCandidate(ValueAt valueAt, size_t candidates, float confidenceThreshold)
++{
++    size_t selected = candidates;
++    float selectedArea = 0.0f;
++    float selectedConfidence = confidenceThreshold;
++    for (size_t candidate = 0; candidate < candidates; ++candidate) {
++        const float confidence = valueAt(4 * candidates + candidate);
++        if (confidence <= confidenceThreshold) {
++            continue;
++        }
++        const float width = std::max(0.0f, valueAt(2 * candidates + candidate));
++        const float height = std::max(0.0f, valueAt(3 * candidates + candidate));
++        const float area = width * height;
++        if (area > selectedArea || (area == selectedArea && confidence > selectedConfidence)) {
++            selected = candidate;
++            selectedArea = area;
++            selectedConfidence = confidence;
++        }
++    }
++    return selected;
++}
++
++} /* namespace alif::app::object_detection */
++
++#endif /* CUBE_FACE_YOLO_V8_HPP */
+diff --git a/source/app/use_case/alif_object_detection/include/cube_cross_hint.h b/source/app/use_case/alif_object_detection/include/cube_cross_hint.h
+new file mode 100644
+index 00000000..d31497d1
+--- /dev/null
++++ b/source/app/use_case/alif_object_detection/include/cube_cross_hint.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Single-face white-cross observation hint for the AppKit LCD (arc-fdo1, 2026-10-18, honest wording v2).
++ *
++ * Input: the nine letters the kit just read (row-major in the LCD view, 'W','Y','B','G','O','R',
++ * anything else = unsure).  The centre letter says which face is shown, so one read is enough to
++ * say where the white cross stands and what the standard beginner cue is for what is visible.
++ * The hint only describes what is seen; it never claims a turn succeeded.  Pure C, no allocation. */
++#ifndef CUBE_CROSS_HINT_H
++#define CUBE_CROSS_HINT_H
++#include <stddef.h>
++#include <stdio.h>
++
++#define CUBE_CROSS_HINT_LEN 112
++
++static inline int cube_cross_is_colour(char c)
++{
++    return c == 'W' || c == 'Y' || c == 'B' || c == 'G' || c == 'O' || c == 'R';
++}
++
++static inline const char *cube_cross_colour_word(char c)
++{
++    switch (c) {
++        case 'W': return "white"; case 'Y': return "yellow"; case 'B': return "blue";
++        case 'G': return "green"; case 'O': return "orange"; case 'R': return "red";
++        default: return "?";
++    }
++}
++
++/* Writes one short line into out (at least CUBE_CROSS_HINT_LEN bytes); returns the number of white
++ * edge stickers counted on the shown face (0..4), or -1 when no face colour is at the centre.
++ * Honest by construction: one face shows one sticker of each edge, so the line only reports what
++ * is visible and which face to show next; it never says an edge is placed, aligned or solved, and
++ * it assumes no cube orientation (top/bottom mean rows of the face as the camera sees it). */
++static inline int cube_cross_hint(const char letters[9], char *out, size_t out_len)
++{
++    const char centre = letters[4];
++    const int edge[4] = {1, 3, 5, 7};
++    int whites = 0;
++    if (!cube_cross_is_colour(centre)) {
++        snprintf(out, out_len, "SHOW ONE FACE TO THE CAMERA");
++        return -1;
++    }
++    for (int i = 0; i < 4; ++i) whites += letters[edge[i]] == 'W';
++    if (centre == 'W') {
++        if (whites == 4) snprintf(out, out_len, "WHITE FACE: 4/4 EDGE STICKERS WHITE - SHOW EACH SIDE TO CHECK THE OTHER STICKERS");
++        else snprintf(out, out_len, "WHITE FACE: %d/4 EDGE STICKERS WHITE - THE OTHERS ARE ON OTHER FACES", whites);
++        return whites;
++    }
++    if (centre == 'Y') {
++        if (whites) snprintf(out, out_len, "YELLOW FACE: %d WHITE EDGE STICKER%s HERE - SHOW THE SIDE NEXT TO ONE", whites, whites == 1 ? "" : "S");
++        else snprintf(out, out_len, "YELLOW FACE: NO WHITE EDGE STICKER HERE - SHOW A SIDE");
++        return whites;
++    }
++    /* A side face: report its edge stickers; the matching sticker of each edge is on another face. */
++    const char *word = cube_cross_colour_word(centre);
++    if (letters[1] == 'W') { snprintf(out, out_len, "WHITE STICKER IN THE TOP EDGE OF %s - SHOW THE FACE ABOVE FOR ITS OTHER STICKER", word); return whites; }
++    if (letters[3] == 'W' || letters[5] == 'W') { snprintf(out, out_len, "WHITE STICKER IN A SIDE EDGE OF %s - SHOW THE FACE BESIDE IT", word); return whites; }
++    if (letters[7] == 'W') { snprintf(out, out_len, "WHITE STICKER IN THE BOTTOM EDGE OF %s - SHOW THE FACE BELOW FOR ITS OTHER STICKER", word); return whites; }
++    if (letters[1] == centre) { snprintf(out, out_len, "TOP EDGE STICKER MATCHES THE %s CENTRE - SHOW THE FACE ABOVE TO SEE ITS OTHER STICKER", word); return whites; }
++    if (cube_cross_is_colour(letters[1])) snprintf(out, out_len, "TOP EDGE OF %s SHOWS %s - SHOW THE FACE ABOVE TO SEE ITS OTHER STICKER", word, cube_cross_colour_word(letters[1]));
++    else snprintf(out, out_len, "TOP EDGE OF %s UNCLEAR - HOLD STILL", word);
++    return whites;
++}
++#endif
+diff --git a/source/app/use_case/alif_object_detection/src/MainLoop.cc b/source/app/use_case/alif_object_detection/src/MainLoop.cc
+index e412ba7b..9ab135a3 100644
+--- a/source/app/use_case/alif_object_detection/src/MainLoop.cc
++++ b/source/app/use_case/alif_object_detection/src/MainLoop.cc
+@@ -1,6 +1,6 @@
+ /* This file was ported to work on Alif Semiconductor devices. */
+ 
+-/* Copyright (C) 2023 Alif Semiconductor - All Rights Reserved.
++/* Copyright (C) 2023, 2026 Alif Semiconductor - All Rights Reserved.
+  * Use, distribution and modification of this code is permitted under the
+  * terms stated in the Alif Semiconductor Software License Agreement
+  *
+@@ -11,7 +11,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2022 Arm Limited. All rights reserved.
++ * Copyright (c) 2022, 2026 Arm Limited. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -54,7 +54,8 @@ void MainLoop()
+     arm::app::fwk::iface::MemoryRegion computeMem{arm::app::tensorArena,
+                                                   sizeof(arm::app::tensorArena)};
+ 
+-    /* Load the model. */
++    /* The YOLO detector owns the face ROI.  CPU colour sampling begins only
++     * after a successful model invocation, so retain normal NPU setup. */
+     if (!model.Init(computeMem, modelMem)) {
+         printf_err("Failed to initialise model\n");
+         return;
+diff --git a/source/app/use_case/alif_object_detection/src/UseCaseHandler.cc b/source/app/use_case/alif_object_detection/src/UseCaseHandler.cc
+index 64771c30..01127b69 100644
+--- a/source/app/use_case/alif_object_detection/src/UseCaseHandler.cc
++++ b/source/app/use_case/alif_object_detection/src/UseCaseHandler.cc
+@@ -27,11 +27,13 @@
+  * limitations under the License.
+  */
+ #include "UseCaseHandler.hpp"
+-#include "mlek/use_case/object_detection/DetectorPostProcessing.hpp"
+-#include "mlek/use_case/object_detection/DetectorPreProcessing.hpp"
++#include "CubeFaceYoloV8.hpp"
++#include "CubeFaceMultiSelect.hpp"
++#include "cube_cross_hint.h"
+ #include "UseCaseCommonUtils.hpp"
+ #include "mlek/fwk/tflm/YoloFastestModel.hpp"
+ #include "mlek/log/log_macros.h"
++#include "mlek/use_case/object_detection/DetectionResult.hpp"
+ #if defined(GPIO_PROFILING)
+ #include "board_utils.h"
+ #endif
+@@ -53,20 +55,21 @@
+ #include "lv_port.h"
+ #include "lvgl.h"
+ 
+-#define PREVIEW_X RTE_PANEL_HACTIVE_TIME
+-#define PREVIEW_Y RTE_PANEL_VACTIVE_LINE
++#include "cube_display_geometry.h"
++#include "cube_camera_mapping.h"
++#define PREVIEW_X CUBE_PREVIEW_WIDTH
++#define PREVIEW_Y CUBE_PREVIEW_HEIGHT
+ 
+ namespace {
+ lv_style_t boxStyle;
+ bool firstCameraFrameReported = false;
++lv_obj_t *cubeStatusLabel = nullptr;
+ };
+ 
+ using arm::app::Profiler;
+ using arm::app::ApplicationContext;
+ using arm::app::fwk::iface::Model;
+ using arm::app::fwk::tflm::YoloFastestModel;
+-using arm::app::DetectorPreProcess;
+-using arm::app::DetectorPostProcess;
+ 
+ namespace alif {
+ namespace app {
+@@ -116,6 +119,15 @@ using namespace arm::app::object_detection;
+         lv_style_set_outline_pad(&boxStyle, 0);
+         lv_style_set_outline_color(&boxStyle, lv_color_hex(0x00FF00));
+         lv_style_set_radius(&boxStyle, 0);
++        cubeStatusLabel = lv_label_create(lv_layer_top());
++        lv_obj_set_style_text_color(cubeStatusLabel, lv_color_hex(0xFFFFFF), 0);
++        lv_obj_set_style_bg_color(cubeStatusLabel, lv_color_hex(0x000000), 0);
++        lv_obj_set_style_bg_opa(cubeStatusLabel, LV_OPA_COVER, 0);
++        lv_obj_set_style_pad_all(cubeStatusLabel, 6, 0);
++        lv_obj_set_style_text_align(cubeStatusLabel, LV_TEXT_ALIGN_CENTER, 0);
++        lv_obj_set_width(cubeStatusLabel, PREVIEW_X);
++        lv_obj_set_pos(cubeStatusLabel, 0, CUBE_STATUS_Y);
++        lv_label_set_text(cubeStatusLabel, "CPU RAW: waiting for face");
+         lv_port_unlock(lv_lock_state);
+ 
+         /* Initialise the camera */
+@@ -126,8 +138,12 @@ using namespace arm::app::object_detection;
+ 
+         auto inputTensor = model.GetInputTensor(0);
+         const auto inputShape = inputTensor->Shape();
+-        const uint32_t inputImgCols = inputShape[arm::app::fwk::tflm::YoloFastestModel::ms_inputColsIdx];
+-        const uint32_t inputImgRows   = inputShape[arm::app::fwk::tflm::YoloFastestModel::ms_inputRowsIdx];
++        if (inputShape.size() != 4 || inputShape[0] != 1 || inputShape[1] != 3) {
++            printf_err("Cube-face YOLOv8 input must be [1,3,H,W]\n");
++            return false;
++        }
++        const uint32_t inputImgRows = inputShape[2];
++        const uint32_t inputImgCols = inputShape[3];
+ 
+         auto bCamera = hal_camera_configure(inputImgCols, inputImgRows, HAL_CAMERA_MODE_SINGLE_FRAME, HAL_CAMERA_COLOUR_FORMAT_RGB888);
+         if (!bCamera) {
+@@ -155,6 +171,155 @@ using namespace arm::app::object_detection;
+            const std::vector<object_detection::DetectionResult>& results,
+            int imgInputCols, int imgInputRows);
+ 
++    /* The cube-face model is YOLOv8 detect, not the vendor's two-branch
++     * YoloFastest model.  Its sole output is quantized [1, 5, 756] CHW:
++     * centre x/y, width, height, then the one cube-face confidence.  Select
++     * the largest valid face rather than a high-confidence individual sticker. */
++    static bool DecodeCubeFaceYoloV8(
++            const std::shared_ptr<arm::app::fwk::iface::TensorIface>& outputTensor,
++            int inputImgCols,
++            int inputImgRows,
++            std::vector<object_detection::DetectionResult>& results)
++    {
++        constexpr size_t channels = 5;
++        constexpr size_t candidates = 756;
++        constexpr float confidenceThreshold = 0.25f;
++
++        if (!outputTensor || outputTensor->GetNumElements() != channels * candidates ||
++            (outputTensor->Type() != arm::app::fwk::iface::TensorType::INT8 &&
++             outputTensor->Type() != arm::app::fwk::iface::TensorType::FP32)) {
++            printf_err("Unexpected cube-face YOLOv8 output tensor\n");
++            return false;
++        }
++
++        const auto quant = outputTensor->GetQuantParams();
++        const auto tensorType = outputTensor->Type();
++        const auto* int8Data = tensorType == arm::app::fwk::iface::TensorType::INT8
++                                   ? outputTensor->GetData<int8_t>()
++                                   : nullptr;
++        const auto* floatData = tensorType == arm::app::fwk::iface::TensorType::FP32
++                                    ? outputTensor->GetData<float>()
++                                    : nullptr;
++        if ((int8Data && quant.scale <= 0.0f) || (!int8Data && !floatData)) {
++            printf_err("Invalid cube-face YOLOv8 output quantization\n");
++            return false;
++        }
++
++        const auto valueAt = [&](size_t index) {
++            return floatData ? floatData[index]
++                             : (static_cast<float>(int8Data[index]) - quant.offset) * quant.scale;
++        };
++
++        /* One to three faces per image: confidence > threshold, no single stickers, NMS, largest first. */
++        size_t selected[3];
++        const size_t faces = object_detection::SelectCubeFaces(valueAt, candidates, confidenceThreshold,
++                                                               0.04f, 0.5f, 3, selected);
++        for (size_t face = 0; face < faces; ++face) {
++            const size_t best = selected[face];
++            const auto dequantize = [&](size_t channel) {
++                return valueAt(channel * candidates + best);
++            };
++            const float centreX = dequantize(0) * inputImgCols;
++            const float centreY = dequantize(1) * inputImgRows;
++            const float width = std::max(0.0f, dequantize(2) * inputImgCols);
++            const float height = std::max(0.0f, dequantize(3) * inputImgRows);
++            const float x0 = std::clamp(centreX - width / 2.0f, 0.0f,
++                                        static_cast<float>(inputImgCols));
++            const float y0 = std::clamp(centreY - height / 2.0f, 0.0f,
++                                        static_cast<float>(inputImgRows));
++            const float x1 = std::clamp(centreX + width / 2.0f, 0.0f,
++                                        static_cast<float>(inputImgCols));
++            const float y1 = std::clamp(centreY + height / 2.0f, 0.0f,
++                                        static_cast<float>(inputImgRows));
++            if (x1 <= x0 || y1 <= y0) {
++                continue;
++            }
++            results.push_back({valueAt(4 * candidates + best), static_cast<int>(x0), static_cast<int>(y0),
++                               static_cast<int>(x1 - x0), static_cast<int>(y1 - y0)});
++        }
++        return true;
++    }
++
++    /* The exported model has float32 NCHW input [1, 3, 192, 192] normalized
++     * to [0, 1].  The vendor preprocessor converts RGB to grayscale and is
++     * therefore not valid for this model. */
++    static bool PopulateCubeFaceInput(
++            const std::shared_ptr<arm::app::fwk::iface::TensorIface>& inputTensor,
++            const uint8_t* rgb,
++            size_t rgbBytes,
++            int inputImgCols,
++            int inputImgRows)
++    {
++        const size_t pixels = static_cast<size_t>(inputImgCols) * inputImgRows;
++        if (!inputTensor || !rgb || inputTensor->Type() != arm::app::fwk::iface::TensorType::FP32 ||
++            inputTensor->GetNumElements() != 3 * pixels || rgbBytes < 3 * pixels) {
++            printf_err("Unexpected cube-face YOLOv8 input tensor or frame\n");
++            return false;
++        }
++
++        auto* input = inputTensor->GetData<float>();
++        if (!input) {
++            printf_err("Invalid cube-face YOLOv8 input buffer\n");
++            return false;
++        }
++        constexpr float normalizer = 1.0f / 255.0f;
++        const auto savedWhiteBalance = [](uint8_t sample, float gain) {
++            return std::clamp(static_cast<float>(sample) * gain, 0.0f, 255.0f);
++        };
++        for (size_t pixel = 0; pixel < pixels; ++pixel) {
++            /* Keep currImage raw: the CPU ROI reader uses that exact source
++             * and applies its locked calibration once.  Only the detector's
++             * float input receives the saved tablecal white balance. */
++            input[pixel] = savedWhiteBalance(rgb[3 * pixel], CUBE_TABLECAL_WHITE_GAIN_R) * normalizer;
++            input[pixels + pixel] = savedWhiteBalance(rgb[3 * pixel + 1], CUBE_TABLECAL_WHITE_GAIN_G) * normalizer;
++            input[2 * pixels + pixel] = savedWhiteBalance(rgb[3 * pixel + 2], CUBE_TABLECAL_WHITE_GAIN_B) * normalizer;
++        }
++        return true;
++    }
++
++    /* CPU CAL reuses the accepted white-cross calibration.  It never invokes a
++     * PTE: the model only supplies the ROI that is sampled by the CPU reader. */
++    static void UpdateCpuNineCellReadout(const uint8_t* rgb, size_t rgbBytes,
++                                         int width, int height,
++                                         const std::vector<object_detection::DetectionResult>& results)
++    {
++        if (!cubeStatusLabel || !rgb || rgbBytes < static_cast<size_t>(width) * height * 3) {
++            if (cubeStatusLabel) lv_label_set_text(cubeStatusLabel, "CPU CAL: camera unavailable");
++            return;
++        }
++        if (results.empty()) {
++            if (hal_camera_cube_is_read_mode()) lv_label_set_text(cubeStatusLabel, "CPU CAL: no face");
++            else lv_label_set_text_fmt(cubeStatusLabel, "CPU CAL: %s", hal_camera_cube_status());
++            return;
++        }
++        /* Up to three faces, largest first; the tutoring cue follows the largest face read. */
++        char label[3 * 9 + 2 * 3 + 1] = {};
++        char first[10] = {};
++        size_t shown = 0;
++        for (size_t i = 0; i < results.size() && shown < 3; ++i) {
++            const auto& face = results[i];
++            char letters[10]{};
++            if (!hal_camera_cube_read_selected_roi(rgb, width, height, face.m_x0,
++                                                   face.m_y0, face.m_w, face.m_h, letters)) {
++                continue;
++            }
++            if (shown == 0) {
++                std::memcpy(first, letters, sizeof first);
++            } else {
++                std::strcat(label, " | ");
++            }
++            std::strcat(label, letters);
++            ++shown;
++        }
++        if (shown == 0) {
++            lv_label_set_text_fmt(cubeStatusLabel, "CPU CAL: %s", hal_camera_cube_status());
++            return;
++        }
++        char hint[CUBE_CROSS_HINT_LEN];
++        cube_cross_hint(first, hint, sizeof hint);
++        lv_label_set_text_fmt(cubeStatusLabel, "CPU CAL: %s\n%s", label, hint);
++    }
++
+     /* Object detection inference handler. */
+     bool ObjectDetectionHandler(ApplicationContext& ctx)
+     {
+@@ -168,30 +333,19 @@ using namespace arm::app::object_detection;
+ 
+         auto inputTensor = model.GetInputTensor(0);
+         auto outputTensor0 = model.GetOutputTensor(0);
+-        auto outputTensor1 = model.GetOutputTensor(1);
+         const auto inputShape = inputTensor->Shape();
+         if (inputShape.empty()) {
+             printf_err("Invalid input tensor dims\n");
+             return false;
+-        } else if (inputShape.size() < 3) {
+-            printf_err("Input tensor dimension should be >= 3\n");
++        } else if (inputShape.size() != 4 || inputShape[0] != 1 || inputShape[1] != 3) {
++            printf_err("Cube-face YOLOv8 input must be [1,3,H,W]\n");
+             return false;
+         }
+ 
+-        const int inputImgCols = inputShape[arm::app::fwk::tflm::YoloFastestModel::ms_inputColsIdx];
+-        const int inputImgRows   = inputShape[arm::app::fwk::tflm::YoloFastestModel::ms_inputRowsIdx];
+-
+-        /* Set up pre and post-processing. */
+-        DetectorPreProcess preProcess = DetectorPreProcess(inputTensor, true, model.IsDataSigned());
++        const int inputImgRows = inputShape[2];
++        const int inputImgCols = inputShape[3];
+ 
+         std::vector<object_detection::DetectionResult> results;
+-        const object_detection::PostProcessParams postProcessParams {
+-            inputImgRows, inputImgCols, object_detection::originalImageSize,
+-            object_detection::anchor1, object_detection::anchor2
+-        };
+-        DetectorPostProcess postProcess = DetectorPostProcess(outputTensor0, outputTensor1,
+-                results, postProcessParams);
+-
+         /* Ensure there are no results leftover from previous inference when running all. */
+         results.clear();
+ 
+@@ -218,12 +372,14 @@ using namespace arm::app::object_detection;
+         }
+ 
+         {
+-            ScopedLVGLLock lv_lock;
+-
+-            /* Camera preview buffer is full-panel RGB888 in LVGL byte order. */
+-            lv_obj_invalidate(ScreenLayoutImageObject());
+-
+-            const size_t copySz = inputTensor->Bytes();
++            /* arc-fdo1 2026-10-18: the LVGL lock masks PendSV (lv_timer_handler).  Holding it across
++             * preprocessing + NPU inference + decode starves rendering for the whole inference; only
++             * the LVGL calls below need it.  Inference touches no LVGL state. */
++            {
++                ScopedLVGLLock lv_lock;
++                /* Camera preview buffer is full-panel RGB888 in LVGL byte order. */
++                lv_obj_invalidate(ScreenLayoutImageObject());
++            }
+ 
+ #if SHOW_INF_TIME
+         uint32_t inf_prof = Get_SysTick_Cycle_Count32();
+@@ -234,7 +390,8 @@ using namespace arm::app::object_detection;
+             BOARD_LED1_BLUE_Control(BOARD_LED_STATE_TOGGLE);
+ #endif
+             /* Run the pre-processing, inference and post-processing. */
+-            if (!preProcess.DoPreProcess(currImage, copySz)) {
++            if (!PopulateCubeFaceInput(inputTensor, currImage, capturedFrameSize,
++                                       inputImgCols, inputImgRows)) {
+                 printf_err("Pre-processing failed.");
+                 return false;
+             }
+@@ -256,7 +413,7 @@ using namespace arm::app::object_detection;
+             powerOk = powerOk && (power_measurement_end(&power) == 0);
+ #endif
+ 
+-            if (!postProcess.DoPostProcess()) {
++            if (!DecodeCubeFaceYoloV8(outputTensor0, inputImgCols, inputImgRows, results)) {
+                 printf_err("Post-processing failed.");
+                 return false;
+             }
+@@ -277,14 +434,16 @@ using namespace arm::app::object_detection;
+             (void)powerOk;
+ #endif
+ 
++            ScopedLVGLLock lv_lock;
+             /* Draw boxes. */
+             DrawDetectionBoxes(results, inputImgCols, inputImgRows);
++            UpdateCpuNineCellReadout(currImage, capturedFrameSize, inputImgCols,
++                                     inputImgRows, results);
+ 
+         } // ScopedLVGLLock
+ 
+ #if VERIFY_TEST_OUTPUT
+         DumpTensor(modelOutput0);
+-        DumpTensor(modelOutput1);
+ #endif /* VERIFY_TEST_OUTPUT */
+ 
+         if (!PresentInferenceResult(results)) {
+@@ -335,32 +494,26 @@ using namespace arm::app::object_detection;
+         lv_obj_t *frame = ScreenLayoutImageHolderObject();
+         const float holderWidth   = (float)lv_obj_get_content_width(frame);
+         const float holderHeight  = (float)lv_obj_get_content_height(frame);
+-        const float modelWidth    = (float)CIMAGE_Y * imgInputCols / imgInputRows;
+-        const float modelHeight   = (float)CIMAGE_Y;
+-        const float previewWidth  = CIMAGE_X * PREVIEW_Y > CIMAGE_Y * PREVIEW_X
+-                                        ? (float)(CIMAGE_Y * PREVIEW_X / PREVIEW_Y)
+-                                        : (float)CIMAGE_X;
+-        const float previewHeight = CIMAGE_X * PREVIEW_Y > CIMAGE_Y * PREVIEW_X
+-                                        ? (float)CIMAGE_Y
+-                                        : (float)(CIMAGE_X * PREVIEW_Y / PREVIEW_X);
+-        const float xScale        = holderWidth * modelWidth / (previewWidth * imgInputCols);
+-        const float yScale        = holderHeight * modelHeight / (previewHeight * imgInputRows);
+-        const float xOffset       = (previewWidth - modelWidth) * holderWidth / (2 * previewWidth);
+-        const float yOffset = (previewHeight - modelHeight) * holderHeight / (2 * previewHeight);
+ 
+         DeleteBoxes(frame);
+ 
+         for (const auto& result: results) {
+-#ifdef ALIF_CAMERA_APPKIT
+-            const float left = xOffset + result.m_x0 * xScale;
+-#else
+-            const float left = holderWidth - xOffset - (result.m_x0 + result.m_w) * xScale;
+-#endif
++            const auto first = cube_camera_model_to_preview(
++                CIMAGE_X, CIMAGE_Y, PREVIEW_X, PREVIEW_Y, imgInputCols,
++                imgInputRows, result.m_x0, result.m_y0);
++            const auto last = cube_camera_model_to_preview(
++                CIMAGE_X, CIMAGE_Y, PREVIEW_X, PREVIEW_Y, imgInputCols,
++                imgInputRows, result.m_x0 + result.m_w, result.m_y0 + result.m_h);
++            const float left = std::max(0.0f, std::min(first.x, last.x));
++            const float top = std::max(0.0f, std::min(first.y, last.y));
++            const float right = std::min((float)PREVIEW_X, std::max(first.x, last.x));
++            const float bottom = std::min((float)PREVIEW_Y, std::max(first.y, last.y));
++            if (right <= left || bottom <= top) continue;
+             CreateBox(frame,
+-                      floor(left),
+-                      floor(yOffset + result.m_y0 * yScale),
+-                      ceil(result.m_w * xScale),
+-                      ceil(result.m_h * yScale));
++                      floor(left * holderWidth / PREVIEW_X),
++                      floor(top * holderHeight / PREVIEW_Y),
++                      ceil((right - left) * holderWidth / PREVIEW_X),
++                      ceil((bottom - top) * holderHeight / PREVIEW_Y));
+         }
+     }
+ 
+diff --git a/source/app/use_case/alif_object_detection/usecase.cmake b/source/app/use_case/alif_object_detection/usecase.cmake
+index 46a503cc..f117943e 100644
+--- a/source/app/use_case/alif_object_detection/usecase.cmake
++++ b/source/app/use_case/alif_object_detection/usecase.cmake
+@@ -54,7 +54,10 @@ USER_OPTION(${use_case}_ANCHOR_2 "Second anchor array estimated during training.
+     STRING)
+ 
+ USER_OPTION(${use_case}_ACTIVATION_BUF_SZ "Activation buffer size for the chosen model"
+-    0x00082000
++    # The U85-256 Vela report for the 192px cube-face model measures
++    # 771.52 KiB SRAM.  One MiB leaves 252 KiB of measured-model headroom
++    # while remaining inside the board's two-MiB Shared_Sram region.
++    0x00100000
+     STRING)
+ 
+ USER_OPTION(${use_case}_SHOW_INF_TIME "Show inference time"
+diff --git a/source/hal/source/components/camera/include/hal_camera.h b/source/hal/source/components/camera/include/hal_camera.h
+index 5705860d..c9c0c654 100644
+--- a/source/hal/source/components/camera/include/hal_camera.h
++++ b/source/hal/source/components/camera/include/hal_camera.h
+@@ -25,6 +25,14 @@ extern "C" {
+ #include <stdint.h>
+ #include <stdbool.h>
+ 
++/* Saved tablecal white gains, derived from the accepted profile's white
++ * reference.  They are deliberately applied only to display/model views;
++ * the CPU reader continues to receive raw camera RGB and owns its existing
++ * calibration correction. */
++#define CUBE_TABLECAL_WHITE_GAIN_R 6.03101015f
++#define CUBE_TABLECAL_WHITE_GAIN_G 4.33846188f
++#define CUBE_TABLECAL_WHITE_GAIN_B 5.17589474f
++
+ /**< Camera device's operating modes */
+ typedef enum hal_camera_mode_ {
+     HAL_CAMERA_MODE_SINGLE_FRAME = 0,
+@@ -90,6 +98,18 @@ bool hal_camera_start(void);
+  */
+ const uint8_t* hal_camera_get_captured_frame(uint32_t* size);
+ 
++/* Read nine cells from the selected ML-frame face ROI.  The implementation
++ * resamples a private BGR tile and reuses the validated cube calibration;
++ * the caller's model frame is never modified. */
++bool hal_camera_cube_read_selected_roi(const uint8_t* rgb, uint32_t frame_width,
++                                       uint32_t frame_height, int32_t x0,
++                                       int32_t y0, int32_t width, int32_t height,
++                                       char letters[10]);
++
++/* Human-readable CAL/READ state maintained by the accepted any-button path. */
++const char* hal_camera_cube_status(void);
++bool hal_camera_cube_is_read_mode(void);
++
+ /**
+  * @brief  Stops the camera device.
+  * @return true if successful, false otherwise.
+diff --git a/source/hal/source/components/camera/source/alif/CMakeLists.txt b/source/hal/source/components/camera/source/alif/CMakeLists.txt
+index 3dcf1a4f..71cb60f0 100644
+--- a/source/hal/source/components/camera/source/alif/CMakeLists.txt
++++ b/source/hal/source/components/camera/source/alif/CMakeLists.txt
+@@ -23,6 +23,11 @@ project(hal_camera_alif
+ # Add top level interface library
+ set(CAMERA_IFACE_TARGET camera_iface_alif)
+ add_library(${CAMERA_IFACE_TARGET} INTERFACE)
++if (NOT DEFINED ROTATE_DISPLAY)
++    set(ROTATE_DISPLAY "0" CACHE STRING "Rotate display by 0, 90, 180 or 270 degrees")
++endif()
++target_compile_definitions(${CAMERA_IFACE_TARGET} INTERFACE
++    CUBE_DISPLAY_ROTATION=${ROTATE_DISPLAY})
+ target_include_directories(${CAMERA_IFACE_TARGET}
+     INTERFACE
+     include
+diff --git a/source/hal/source/components/camera/source/alif/include/cube_display_geometry.h b/source/hal/source/components/camera/source/alif/include/cube_display_geometry.h
+new file mode 100644
+index 00000000..57ead804
+--- /dev/null
++++ b/source/hal/source/components/camera/source/alif/include/cube_display_geometry.h
+@@ -0,0 +1,19 @@
++#ifndef CUBE_DISPLAY_GEOMETRY_H
++#define CUBE_DISPLAY_GEOMETRY_H
++
++#ifndef CUBE_DISPLAY_ROTATION
++#define CUBE_DISPLAY_ROTATION 0
++#endif
++
++/* Camera pixels and overlays share LVGL's logical canvas. The LCD scanout
++ * remains physical panel size; lv_port rotates the complete composition. */
++#if CUBE_DISPLAY_ROTATION == 90 || CUBE_DISPLAY_ROTATION == 270
++#define CUBE_PREVIEW_WIDTH RTE_PANEL_VACTIVE_LINE
++#define CUBE_PREVIEW_HEIGHT RTE_PANEL_HACTIVE_TIME
++#else
++#define CUBE_PREVIEW_WIDTH RTE_PANEL_HACTIVE_TIME
++#define CUBE_PREVIEW_HEIGHT RTE_PANEL_VACTIVE_LINE
++#endif
++#define CUBE_STATUS_Y ((CUBE_PREVIEW_HEIGHT - 240) / 2 + 270)
++
++#endif
+diff --git a/source/hal/source/components/camera/source/alif/source/cube_button_actions.h b/source/hal/source/components/camera/source/alif/source/cube_button_actions.h
+new file mode 100644
+index 00000000..4abc20ef
+--- /dev/null
++++ b/source/hal/source/components/camera/source/alif/source/cube_button_actions.h
+@@ -0,0 +1,37 @@
++#ifndef CUBE_BUTTON_ACTIONS_H
++#define CUBE_BUTTON_ACTIONS_H
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef struct {
++    bool raw_pressed, stable_pressed, long_sent;
++    uint32_t changed_ms, pressed_ms;
++} cube_button_state;
++
++/* Treat all joystick contacts as one action. Only a debounced all-released
++ * interval re-arms a short press, so chords cannot CAL and LOCK at once. */
++static inline uint32_t cube_button_action(cube_button_state *s, uint32_t mask,
++                                         uint32_t now_ms, uint32_t read_mode)
++{
++    bool pressed = mask != 0;
++    if (pressed != s->raw_pressed) {
++        s->raw_pressed = pressed;
++        s->changed_ms = now_ms;
++    }
++    if (pressed != s->stable_pressed && (uint32_t)(now_ms - s->changed_ms) >= 50) {
++        s->stable_pressed = pressed;
++        if (pressed) {
++            s->pressed_ms = now_ms;
++            s->long_sent = false;
++        } else if (!s->long_sent) {
++            return read_mode ? 2 : 1;
++        }
++    }
++    if (s->stable_pressed && pressed && !s->long_sent &&
++        (uint32_t)(now_ms - s->pressed_ms) >= 1500) {
++        s->long_sent = true;
++        return 2;
++    }
++    return 0;
++}
++#endif
+diff --git a/source/hal/source/components/camera/source/alif/source/cube_camera_mapping.h b/source/hal/source/components/camera/source/alif/source/cube_camera_mapping.h
+new file mode 100644
+index 00000000..b3271e96
+--- /dev/null
++++ b/source/hal/source/components/camera/source/alif/source/cube_camera_mapping.h
+@@ -0,0 +1,54 @@
++#ifndef CUBE_CAMERA_MAPPING_H
++#define CUBE_CAMERA_MAPPING_H
++
++#include <stdint.h>
++
++/* Inverse map: sensor -> clockwise quarter-turn -> aspect-preserving central
++ * crop -> one horizontal mirror in the logical LCD view. UI is not rotated
++ * here; LVGL still owns ROTATE_DISPLAY=90 for the complete composition. */
++static inline uint32_t cube_camera_source_index(uint32_t width, uint32_t height,
++                                               uint32_t output_width,
++                                               uint32_t output_height,
++                                               uint32_t x, uint32_t y)
++{
++    const uint32_t rotated_width = height, rotated_height = width;
++    const uint32_t crop_width = rotated_width * output_height > rotated_height * output_width
++        ? rotated_height * output_width / output_height : rotated_width;
++    const uint32_t crop_height = rotated_width * output_height > rotated_height * output_width
++        ? rotated_height : rotated_width * output_height / output_width;
++    const uint32_t rx = (rotated_width - crop_width) / 2 + crop_width - 1
++        - x * crop_width / output_width;
++    const uint32_t ry = (rotated_height - crop_height) / 2
++        + y * crop_height / output_height;
++    /* Clockwise output (rx,ry) comes from sensor (ry,height-1-rx). */
++    return (height - 1 - rx) * width + ry;
++}
++
++typedef struct { float x, y; } cube_camera_point;
++
++/* Forward map for model coordinates produced from the unrotated/unmirrored
++ * sensor crop. It is the continuous inverse of cube_camera_source_index:
++ * clockwise source rotation, central landscape crop, then one mirror. */
++static inline cube_camera_point cube_camera_model_to_preview(
++    uint32_t sensor_width, uint32_t sensor_height, uint32_t preview_width,
++    uint32_t preview_height, uint32_t model_width, uint32_t model_height,
++    float model_x, float model_y)
++{
++    const float rotated_width = (float)sensor_height;
++    const float rotated_height = (float)sensor_width;
++    const float crop_width = rotated_width * preview_height > rotated_height * preview_width
++        ? rotated_height * preview_width / preview_height : rotated_width;
++    const float crop_height = rotated_width * preview_height > rotated_height * preview_width
++        ? rotated_height : rotated_width * preview_height / preview_width;
++    const float sensor_x = model_x * sensor_width / model_width;
++    const float sensor_y = model_y * sensor_height / model_height;
++    const float rx = sensor_height - 1.0f - sensor_y;
++    const float ry = sensor_x;
++    cube_camera_point point = {
++        ((rotated_width - crop_width) / 2.0f + crop_width - 1.0f - rx) * preview_width / crop_width,
++        (ry - (rotated_height - crop_height) / 2.0f) * preview_height / crop_height
++    };
++    return point;
++}
++
++#endif
+diff --git a/source/hal/source/components/camera/source/alif/source/cube_preview.h b/source/hal/source/components/camera/source/alif/source/cube_preview.h
+new file mode 100644
+index 00000000..a878883d
+--- /dev/null
++++ b/source/hal/source/components/camera/source/alif/source/cube_preview.h
+@@ -0,0 +1,402 @@
++/* SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates
++ * <open-source-office@arm.com>
++ * SPDX-License-Identifier: Apache-2.0
++ */
++#ifndef CUBE_PREVIEW_H
++#define CUBE_PREVIEW_H
++
++#include <stdint.h>
++#include <math.h>
++
++typedef struct { uint8_t r, g, b; char letter; } cube_colour;
++static const cube_colour cube_palette[7] = {
++    {235, 235, 235, 'W'}, {240, 220, 40, 'Y'}, {200, 30, 40, 'R'},
++    {240, 120, 30, 'O'}, {30, 80, 200, 'B'}, {40, 170, 70, 'G'},
++    {128, 128, 128, '?'}
++};
++
++static inline unsigned cube_nearest_colour(unsigned r, unsigned g, unsigned b)
++{
++    unsigned best = 0, best_distance = UINT32_MAX;
++    for (unsigned i = 0; i < 6; ++i) {
++        int dr = (int)r - cube_palette[i].r;
++        int dg = (int)g - cube_palette[i].g;
++        int db = (int)b - cube_palette[i].b;
++        unsigned distance = (unsigned)(dr * dr + dg * dg + db * db);
++        if (distance < best_distance) { best = i; best_distance = distance; }
++    }
++    return best;
++}
++
++/* Geometry shared by the detector ROI bridge and its host test.  A 15px
++ * minimum preserves distinct 3x3 cells before resampling to the 240px guide. */
++static inline int cube_roi_is_valid(uint32_t frame_width, uint32_t frame_height,
++                                    int32_t x0, int32_t y0,
++                                    int32_t width, int32_t height)
++{
++    return width >= 15 && height >= 15 && x0 >= 0 && y0 >= 0 &&
++        x0 + width <= (int32_t)frame_width && y0 + height <= (int32_t)frame_height;
++}
++
++static inline uint32_t cube_roi_source_index(uint32_t frame_width, int32_t x0,
++                                              int32_t y0, int32_t width,
++                                              int32_t height, uint32_t tile_x,
++                                              uint32_t tile_y)
++{
++    return ((uint32_t)(y0 + (int32_t)(tile_y * (uint32_t)height / 240)) * frame_width) +
++           (uint32_t)(x0 + (int32_t)(tile_x * (uint32_t)width / 240));
++}
++
++typedef struct {
++    uint32_t magic;
++    uint32_t frame_count;
++    float gains[3];
++    char raw_letters[10];
++    char balanced_letters[10];
++    float raw_rgb[9][3];
++    float balanced_rgb[9][3];
++    float hsv[9][3];
++    float stddev[9];
++    float hue_distance[9];
++    uint32_t abstain_mask;
++    uint32_t abstain_count;
++    float white_ref[3];
++    uint32_t mode; /* 0: CALIBRATION, 1: READ */
++    uint32_t white_valid;
++    uint32_t white_streak;
++    uint32_t abstain_since_ms;
++    uint32_t white_success_count;
++    float corner_rgb[4][3];
++    float corner_hsv[4][3];
++    float candidate_rgb[3];
++    uint32_t logo_mask;
++    uint32_t reference_mask;
++    float logo_ref_raw[3];
++    float logo_ref_rgb[3];
++    float logo_ref_hsv[3];
++    uint32_t logo_ref_valid;
++    uint32_t cross_valid;
++    uint32_t lock_rejected;
++    float cross_balanced_rgb[4][3];
++    float cross_hsv[4][3];
++} cube_diagnostics;
++
++static inline int cube_matches_saved_table_profile(const cube_diagnostics *diagnostics)
++{
++    static const float saved_white_ref[3] = {38.9652786f, 54.1666641f, 45.4027786f};
++    if (!diagnostics->white_valid) return 0;
++    for (unsigned c = 0; c < 3; ++c)
++        if (fabsf(diagnostics->white_ref[c] - saved_white_ref[c]) > 0.01f) return 0;
++    return 1;
++}
++
++static inline float cube_median4(const float input[4])
++{
++    float values[4] = {input[0], input[1], input[2], input[3]};
++    for (unsigned i = 1; i < 4; ++i) {
++        float value = values[i];
++        unsigned j = i;
++        while (j && values[j - 1] > value) { values[j] = values[j - 1]; --j; }
++        values[j] = value;
++    }
++    return (values[1] + values[2]) / 2;
++}
++
++static inline float cube_clamp(float value, float low, float high)
++{
++    return value < low ? low : (value > high ? high : value);
++}
++
++static inline unsigned cube_hsv_colour_for_profile(const float rgb[3], float hsv[3],
++                                                   int saved_table_profile)
++{
++    float r = rgb[0] / 255.0f, g = rgb[1] / 255.0f, b = rgb[2] / 255.0f;
++    float high = r > g ? r : g;
++    if (b > high) high = b;
++    float low = r < g ? r : g;
++    if (b < low) low = b;
++    float delta = high - low, hue = 0.0f;
++    if (delta > 0.000001f) {
++        if (high == r) hue = 60.0f * (g - b) / delta;
++        else if (high == g) hue = 60.0f * (2.0f + (b - r) / delta);
++        else hue = 60.0f * (4.0f + (r - g) / delta);
++        if (hue < 0) hue += 360.0f;
++    }
++    hsv[0] = hue;
++    hsv[1] = high > 0 ? delta / high : 0;
++    hsv[2] = high;
++    /* Saved white references are S~0..0.03.  The table capture contains a
++     * confirmed green at H106/S0.115/V0.668, so a 0.15 white cutoff loses
++     * real chroma.  Keep the neutral region narrow and use its hue evidence. */
++    if (hsv[1] < 0.10f && high > 0.55f) return 0;
++    /* OC-authorized table-specific manual calibration.  Only the saved
++     * profile's locked references may map its measured saturated H0..15
++     * orange samples before the generic H0..20 red branch. */
++    if (saved_table_profile && hue <= 15.0f && hsv[1] >= 0.38f && hsv[2] >= 0.70f)
++        return 3;
++    if (hue >= 340 || hue < 20) return 2;
++    /* Captured table yellow is H41/S0.32..0.37; leave the H25 orange band
++     * intact and make the natural orange/yellow boundary H35. */
++    if (hue < 35) return 3;
++    if (hue < 75) return 1;
++    if (hue < 170) return 5;
++    if (hue < 270) return 4;
++    /* Purple is outside the supplied bands; choose the nearer blue/red band. */
++    return hue < 305 ? 4 : 2;
++}
++
++static inline unsigned cube_hsv_colour(const float rgb[3], float hsv[3])
++{
++    return cube_hsv_colour_for_profile(rgb, hsv, 0);
++}
++
++/* LVGL's full-panel RGB888 source is stored B,G,R, independently of the
++ * RGB565 scanout. Sample the untouched source before drawing any overlays. */
++static inline void cube_preview_read_and_draw(uint8_t *bgr, unsigned width,
++                                              unsigned height, char letters[10],
++                                              cube_diagnostics *diagnostics,
++                                              uint32_t now_ms, uint32_t calibration_request)
++{
++    unsigned classes[9];
++    uint32_t white_success_before = diagnostics->white_success_count;
++    uint32_t totals[3] = {0, 0, 0};
++    unsigned balance_pixels = 0;
++    diagnostics->abstain_mask = diagnostics->abstain_count = 0;
++    diagnostics->logo_mask = 0;
++    diagnostics->reference_mask = diagnostics->mode == 0 ? 0xAA : 0;
++    const unsigned x0 = (width - 240) / 2, y0 = (height - 240) / 2;
++    for (unsigned cell = 0; cell < 9; ++cell) {
++        unsigned cx = x0 + (cell % 3) * 80 + 40;
++        unsigned cy = y0 + (cell / 3) * 80 + 40;
++        float patch_means[3][4], patch_variances[3][4];
++        for (unsigned patch = 0; patch < 4; ++patch) {
++            unsigned px = cx + ((patch & 1) ? 24 : -24);
++            unsigned py = cy + ((patch & 2) ? 24 : -24);
++            uint32_t sum[3] = {0, 0, 0}, squares[3] = {0, 0, 0};
++            for (unsigned y = py - 3; y < py + 3; ++y) {
++                for (unsigned x = px - 3; x < px + 3; ++x) {
++                    const uint8_t *p = bgr + (y * width + x) * 3;
++                    for (unsigned c = 0; c < 3; ++c) {
++                        unsigned value = p[2 - c];
++                        sum[c] += value; squares[c] += value * value;
++                    }
++                }
++            }
++            for (unsigned c = 0; c < 3; ++c) {
++                patch_means[c][patch] = sum[c] / 36.0f;
++                patch_variances[c][patch] = squares[c] / 36.0f -
++                    patch_means[c][patch] * patch_means[c][patch];
++            }
++        }
++        float max_variance = 0;
++        for (unsigned c = 0; c < 3; ++c) {
++            diagnostics->raw_rgb[cell][c] = cube_median4(patch_means[c]);
++            float variance = cube_median4(patch_variances[c]);
++            if (variance > max_variance) max_variance = variance;
++            totals[c] += (uint32_t)(diagnostics->raw_rgb[cell][c] * 100);
++        }
++        /* Median patch variance rejects one logo/highlight outlier. */
++        diagnostics->stddev[cell] = sqrtf(max_variance);
++        balance_pixels += 100;
++        unsigned raw_class = cube_nearest_colour(diagnostics->raw_rgb[cell][0],
++            diagnostics->raw_rgb[cell][1], diagnostics->raw_rgb[cell][2]);
++        diagnostics->raw_letters[cell] = cube_palette[raw_class].letter;
++    }
++    /* Estimate gains from nine sticker patches plus the unpainted perimeter,
++     * avoiding the mostly-red guide interior and any synthetic overlay. */
++    for (unsigned y = 0; y < 240; ++y) {
++        for (unsigned x = 0; x < 240; ++x) {
++            if (x != 0 && x != 239 && y != 0 && y != 239) continue;
++            const uint8_t *p = bgr + ((y0 + y) * width + x0 + x) * 3;
++            totals[0] += p[2]; totals[1] += p[1]; totals[2] += p[0];
++            ++balance_pixels;
++        }
++    }
++    float overall = (totals[0] + totals[1] + totals[2]) / 3.0f;
++    if (calibration_request == 2) {
++        diagnostics->mode = 0;
++        diagnostics->white_valid = 0;
++        diagnostics->logo_ref_valid = 0;
++        diagnostics->white_streak = 0;
++        diagnostics->lock_rejected = 0;
++    }
++    if (diagnostics->mode == 0) {
++        const unsigned edges[4] = {1, 3, 5, 7};
++        unsigned qualified = 0;
++        for (unsigned corner = 0; corner < 4; ++corner) {
++            for (unsigned c = 0; c < 3; ++c)
++                diagnostics->corner_rgb[corner][c] = diagnostics->raw_rgb[edges[corner]][c];
++            cube_hsv_colour(diagnostics->corner_rgb[corner], diagnostics->corner_hsv[corner]);
++            if (diagnostics->corner_hsv[corner][1] < 0.35f &&
++                diagnostics->corner_hsv[corner][2] > 0.4f) ++qualified;
++        }
++        for (unsigned c = 0; c < 3; ++c) {
++            float edge_values[4];
++            for (unsigned i = 0; i < 4; ++i) edge_values[i] = diagnostics->corner_rgb[i][c];
++            diagnostics->candidate_rgb[c] = cube_median4(edge_values);
++        }
++        diagnostics->cross_valid = 1;
++        for (unsigned edge = 0; edge < 4; ++edge) {
++            for (unsigned c = 0; c < 3; ++c) {
++                float candidate = diagnostics->candidate_rgb[c];
++                float value = diagnostics->corner_rgb[edge][c];
++                diagnostics->cross_balanced_rgb[edge][c] = cube_clamp(
++                    value * 235.0f / (candidate > 1 ? candidate : 1), 0, 255);
++                if (candidate < 1 || fabsf(value - candidate) > 0.15f * candidate)
++                    diagnostics->cross_valid = 0;
++            }
++            cube_hsv_colour(diagnostics->cross_balanced_rgb[edge], diagnostics->cross_hsv[edge]);
++            if (diagnostics->cross_hsv[edge][1] >= 0.25f ||
++                diagnostics->cross_hsv[edge][2] <= 0.5f) diagnostics->cross_valid = 0;
++        }
++        diagnostics->white_streak = qualified == 4 ? diagnostics->white_streak + 1 : 0;
++        if (calibration_request == 1 && diagnostics->cross_valid) {
++            for (unsigned c = 0; c < 3; ++c)
++                diagnostics->white_ref[c] = diagnostics->candidate_rgb[c];
++            diagnostics->white_valid = 1;
++            diagnostics->mode = 1;
++            diagnostics->abstain_since_ms = 0;
++            diagnostics->lock_rejected = 0;
++            ++diagnostics->white_success_count;
++        } else if (calibration_request == 1) diagnostics->lock_rejected = 1;
++    }
++    for (unsigned c = 0; c < 3; ++c)
++        diagnostics->gains[c] = diagnostics->white_valid
++            ? 235.0f / (diagnostics->white_ref[c] > 1 ? diagnostics->white_ref[c] : 1)
++            : (totals[c] ? cube_clamp(overall / totals[c], 0.5f, 2.0f) : 2.0f);
++    (void)balance_pixels; /* Equal pixel counts cancel in the gain ratios. */
++    for (unsigned cell = 0; cell < 9; ++cell) {
++        for (unsigned c = 0; c < 3; ++c)
++            diagnostics->balanced_rgb[cell][c] = cube_clamp(
++                diagnostics->raw_rgb[cell][c] * diagnostics->gains[c], 0, 255);
++        classes[cell] = cube_hsv_colour_for_profile(diagnostics->balanced_rgb[cell],
++            diagnostics->hsv[cell], cube_matches_saved_table_profile(diagnostics));
++        const float *hsv = diagnostics->hsv[cell];
++        float distance = 0;
++        if (classes[cell] != 0) {
++            const float palette_hues[5] = {356.5f, 25.7f, 54.0f, 133.85f, 222.35f};
++            distance = 180;
++            for (unsigned i = 0; i < 5; ++i) {
++                float d = fabsf(hsv[0] - palette_hues[i]);
++                if (d > 180) d = 360 - d;
++                if (d < distance) distance = d;
++            }
++        }
++        diagnostics->hue_distance[cell] = distance;
++        /* The observed calibrated blue and green bands are broader than the
++         * red/yellow bands: H262 blue is valid but 40 degrees from the old
++         * blue prototype, and H107 green is 27 degrees from its prototype.
++         * Match the accepted hue bands instead of contradicting them with a
++         * single global distance gate.  Keep the lower cyan edge below H210
++         * strict: the existing H193/S0.257/V0.498 regression remains
++         * deliberately abstained. */
++        const int qualified_blue = classes[cell] == 4 && hsv[0] >= 210.0f &&
++            hsv[1] >= 0.10f && hsv[2] >= 0.35f;
++        const float max_hue_distance = classes[cell] == 4
++            ? (hsv[0] >= 210.0f ? 75.0f : 20.0f)
++            : (classes[cell] == 5 ? 60.0f : 20.0f);
++        if (((hsv[1] < 0.2f && hsv[2] < 0.55f) && !qualified_blue) ||
++            diagnostics->stddev[cell] > 28 || distance > max_hue_distance) {
++            classes[cell] = 6;
++            diagnostics->abstain_mask |= 1u << cell;
++            ++diagnostics->abstain_count;
++        }
++    }
++    if (white_success_before != diagnostics->white_success_count) {
++        for (unsigned c = 0; c < 3; ++c) {
++            diagnostics->logo_ref_raw[c] = diagnostics->raw_rgb[4][c];
++            diagnostics->logo_ref_rgb[c] = diagnostics->balanced_rgb[4][c];
++            diagnostics->logo_ref_hsv[c] = diagnostics->hsv[4][c];
++        }
++        diagnostics->logo_ref_valid = 1;
++    }
++    if (diagnostics->logo_ref_valid) {
++        for (unsigned cell = 0; cell < 9; ++cell) {
++            if (classes[cell] != 6 && classes[cell] != 4 && diagnostics->hsv[cell][2] >= 0.55f)
++                continue;
++            float distance_squared = 0;
++            for (unsigned c = 0; c < 3; ++c) {
++                float delta = diagnostics->balanced_rgb[cell][c] - diagnostics->logo_ref_rgb[c];
++                distance_squared += delta * delta;
++            }
++            if (distance_squared < 25.0f * 25.0f) {
++                if (classes[cell] == 6) {
++                    diagnostics->abstain_mask &= ~(1u << cell);
++                    --diagnostics->abstain_count;
++                }
++                classes[cell] = 0;
++                diagnostics->logo_mask |= 1u << cell;
++            }
++        }
++    }
++    unsigned white_others = 0;
++    for (unsigned cell = 0; cell < 9; ++cell)
++        if (cell != 4 && classes[cell] == 0) ++white_others;
++    if (diagnostics->mode == 0) diagnostics->logo_mask |= 1u << 4;
++    if (white_others == 8 && classes[4] != 0) {
++        if (classes[4] == 6) {
++            diagnostics->abstain_mask &= ~(1u << 4);
++            --diagnostics->abstain_count;
++        }
++        classes[4] = 0;
++        diagnostics->logo_mask |= 1u << 4;
++    }
++    for (unsigned cell = 0; cell < 9; ++cell) {
++        letters[cell] = cube_palette[classes[cell]].letter;
++        diagnostics->balanced_letters[cell] = letters[cell];
++    }
++    letters[9] = '\0';
++    diagnostics->raw_letters[9] = diagnostics->balanced_letters[9] = '\0';
++    (void)now_ms; /* White-cross UX enters calibration only through BACK. */
++    diagnostics->reference_mask = diagnostics->mode == 0 ? 0xAA : 0;
++    diagnostics->magic = 0x43554245;
++    ++diagnostics->frame_count;
++    /* Apply the same gain to the visible camera preview, before drawing
++     * guide/swatch UI. Diagnostics retain the original and corrected samples. */
++    uint32_t gain_q8[3];
++    for (unsigned c = 0; c < 3; ++c) gain_q8[c] = (uint32_t)(diagnostics->gains[c] * 256);
++    for (unsigned i = 0; i < width * height; ++i) {
++        uint8_t *p = bgr + i * 3;
++        for (unsigned c = 0; c < 3; ++c) {
++            uint32_t value = (p[2 - c] * gain_q8[c] + 128) >> 8;
++            p[2 - c] = value > 255 ? 255 : value;
++        }
++    }
++    for (unsigned y = 0; y < 240; ++y) {
++        for (unsigned x = 0; x < 240; ++x) {
++            if (x % 80 < 2 || y % 80 < 2 || x >= 238 || y >= 238) {
++                uint8_t *pixel = bgr + ((y0 + y) * width + x0 + x) * 3;
++                pixel[0] = pixel[1] = pixel[2] = 255;
++            }
++        }
++    }
++    if (diagnostics->reference_mask) {
++        for (unsigned cell = 1; cell < 8; cell += 2) {
++            unsigned left = x0 + cell % 3 * 80, top = y0 + cell / 3 * 80;
++            for (unsigned y = 2; y < 78; ++y)
++                for (unsigned x = 2; x < 78; ++x)
++                    if (x < 4 || x >= 76 || y < 4 || y >= 76) {
++                        uint8_t *p = bgr + ((top + y) * width + left + x) * 3;
++                        p[0] = 0; p[1] = p[2] = 255;
++                    }
++        }
++    }
++    for (unsigned cell = 0; cell < 9; ++cell) {
++        const cube_colour *colour = &cube_palette[classes[cell]];
++        unsigned left = x0 + (cell % 3) * 80 + 6;
++        unsigned top = y0 + (cell / 3) * 80 + 6;
++        for (unsigned y = top; y < top + 20; ++y) {
++            for (unsigned x = left; x < left + 20; ++x) {
++                uint8_t *pixel = bgr + (y * width + x) * 3;
++                pixel[0] = colour->b; pixel[1] = colour->g; pixel[2] = colour->r;
++                if ((diagnostics->logo_mask & (1u << cell)) &&
++                    x - left >= 9 && x - left <= 11 && y - top >= 9 && y - top <= 11)
++                    pixel[0] = pixel[1] = pixel[2] = 0;
++                if (classes[cell] == 6 &&
++                    ((x - left) == (y - top) || (x - left) + (y - top) == 19))
++                    pixel[0] = pixel[1] = pixel[2] = 0;
++            }
++        }
++    }
++}
++#endif
+diff --git a/source/hal/source/components/camera/source/alif/source/hal_camera_alif.c b/source/hal/source/components/camera/source/alif/source/hal_camera_alif.c
+index e33fc273..1dc1513a 100644
+--- a/source/hal/source/components/camera/source/alif/source/hal_camera_alif.c
++++ b/source/hal/source/components/camera/source/alif/source/hal_camera_alif.c
+@@ -28,12 +28,115 @@
+ #include "delay.h"
+ #include <tgmath.h>
+ #include <string.h>
++#include <stdio.h>
++#include "cube_preview.h"
++#include "cube_camera_mapping.h"
++#include "cube_button_actions.h"
+ 
+-#define CAMERA_PREVIEW_WIDTH  RTE_PANEL_HACTIVE_TIME
+-#define CAMERA_PREVIEW_HEIGHT RTE_PANEL_VACTIVE_LINE
++char cube_face_letters[10];
++cube_diagnostics cube_read_diagnostics = {.mode = 1};
++volatile uint32_t cube_calibration_request;
++static char cube_status_text[160];
++
++/* Captured from private/table-calibration-20261018.LK7u1g frame 2907.  This
++ * named compile-time startup profile imports accepted white balance and logo
++ * references without reading live RAM.  It applies before the camera preview
++ * and YOLO ROI bridge; button request 2 still clears it and request 1 still
++ * captures/relocks a normal white-cross calibration. */
++typedef struct {
++    const char *name;
++    float white_ref[3];
++    float logo_ref_raw[3];
++    float logo_ref_rgb[3];
++    float logo_ref_hsv[3];
++} cube_startup_profile;
++
++static const cube_startup_profile cube_startup_profile_tablecal = {
++    .name = "tablecal",
++    .white_ref = {38.9652786f, 54.1666641f, 45.4027786f},
++    .logo_ref_raw = {37.8055573f, 52.8611145f, 43.8055573f},
++    .logo_ref_rgb = {228.0057068f, 229.3359375f, 226.7329559f},
++    .logo_ref_hsv = {90.6625137f, 0.0113501f, 0.8993566f},
++};
++
++static void cube_import_startup_profile(void)
++{
++    static uint32_t imported;
++    if (imported) return;
++    const cube_startup_profile *profile = &cube_startup_profile_tablecal;
++    for (unsigned c = 0; c < 3; ++c) {
++        cube_read_diagnostics.white_ref[c] = profile->white_ref[c];
++        cube_read_diagnostics.logo_ref_raw[c] = profile->logo_ref_raw[c];
++        cube_read_diagnostics.logo_ref_rgb[c] = profile->logo_ref_rgb[c];
++        cube_read_diagnostics.logo_ref_hsv[c] = profile->logo_ref_hsv[c];
++    }
++    cube_read_diagnostics.mode = 1;
++    cube_read_diagnostics.white_valid = 1;
++    cube_read_diagnostics.logo_ref_valid = 1;
++    imported = 1;
++    printf("CUBE profile=%s WB %.2f %.2f %.2f\n", profile->name,
++           (double)profile->white_ref[0], (double)profile->white_ref[1],
++           (double)profile->white_ref[2]);
++}
++
++const char *cube_calibration_status(void)
++{
++    if (!cube_read_diagnostics.mode) {
++        snprintf(cube_status_text, sizeof cube_status_text,
++                 "%sSHOW WHITE CROSS\nANY BUTTON TO LOCK\nRGB %.0f %.0f %.0f | WB: %s",
++                 cube_read_diagnostics.lock_rejected ? "CROSS NOT WHITE\n" : "",
++                 (double)cube_read_diagnostics.candidate_rgb[0],
++                 (double)cube_read_diagnostics.candidate_rgb[1],
++                 (double)cube_read_diagnostics.candidate_rgb[2],
++                 cube_read_diagnostics.white_valid ? "locked" : "auto");
++        return cube_status_text;
++    }
++    if (cube_read_diagnostics.abstain_count >= 5)
++        return cube_read_diagnostics.white_valid ? "NO CUBE | WB: locked\nPRESS ANY BUTTON" : "NO CUBE | WB: auto\nPRESS ANY BUTTON";
++    return cube_read_diagnostics.white_valid ? "READ\nWB: locked\nPRESS ANY BUTTON" : "READ\nWB: auto\nPRESS ANY BUTTON";
++}
++
++int cube_center_is_logo(void) { return (cube_read_diagnostics.logo_mask & 16) != 0; }
++
++static uint32_t cube_button_request(uint32_t now_ms)
++{
++    static cube_button_state state;
++    uint32_t physical_request = cube_button_action(&state,
++        BOARD_JOYSTICK_GetPressedMask(), now_ms, cube_read_diagnostics.mode);
++    uint32_t request = cube_calibration_request;
++    cube_calibration_request = 0;
++    return request ? request : physical_request;
++}
++
++#include "cube_display_geometry.h"
++#define CAMERA_PREVIEW_WIDTH  CUBE_PREVIEW_WIDTH
++#define CAMERA_PREVIEW_HEIGHT CUBE_PREVIEW_HEIGHT
+ /* Full-panel preview uses LVGL RGB888 (B,G,R byte order). */
+ static uint8_t preview_image[CAMERA_PREVIEW_WIDTH * CAMERA_PREVIEW_HEIGHT * RGB_BYTES]
+     __attribute__((aligned(32), section(".bss.large_ram")));
++/* The validated reader expects a 240x240 BGR guide.  This tile is private so
++ * the clean RGB model input and visible preview cannot be modified by it. */
++static uint8_t cube_face_roi_tile[240 * 240 * RGB_BYTES]
++    __attribute__((aligned(32), section(".bss.large_ram")));
++
++static uint8_t cube_apply_saved_white_gain(uint8_t sample, float gain)
++{
++    const float balanced = (float)sample * gain;
++    return (uint8_t)(balanced >= 255.0f ? 255.0f : balanced);
++}
++
++static void cube_white_balance_preview(void)
++{
++    /* preview_image is a dedicated BGR display buffer.  Applying the saved
++     * profile here makes the LCD preview match the detector while retaining
++     * raw camera RGB for the CPU ROI reader and its own one-pass correction. */
++    for (uint32_t pixel = 0; pixel < CAMERA_PREVIEW_WIDTH * CAMERA_PREVIEW_HEIGHT; ++pixel) {
++        uint8_t* bgr = preview_image + pixel * RGB_BYTES;
++        bgr[0] = cube_apply_saved_white_gain(bgr[0], CUBE_TABLECAL_WHITE_GAIN_B);
++        bgr[1] = cube_apply_saved_white_gain(bgr[1], CUBE_TABLECAL_WHITE_GAIN_G);
++        bgr[2] = cube_apply_saved_white_gain(bgr[2], CUBE_TABLECAL_WHITE_GAIN_R);
++    }
++}
+ 
+ 
+ #if !defined(RTE_Drivers_CPI)
+@@ -101,6 +204,7 @@ static void hal_camera_reset(void)
+ bool hal_camera_init(void)
+ {
+     hal_camera_reset();
++    cube_import_startup_profile();
+     info("Initialising camera interface: %s\n", s_cam_dev.name);
+ #ifndef USE_FAKE_CAMERA
+     int32_t err = 0;
+@@ -228,36 +332,23 @@ void camera_update_preview(const uint8_t* image,
+                            uint32_t height,
+                            uint32_t pixel_bytes)
+ {
+-    /* Center-crop to fill the panel without stretching. Read the original
+-     * sensor stride directly, before model preprocessing crops it in place.
+-     * Preserve the DevKit mounting correction; AppKit uses native orientation. */
+-    const uint32_t crop_width     = width * CAMERA_PREVIEW_HEIGHT > height * CAMERA_PREVIEW_WIDTH
+-                                        ? height * CAMERA_PREVIEW_WIDTH / CAMERA_PREVIEW_HEIGHT
+-                                        : width;
+-    const uint32_t crop_height    = width * CAMERA_PREVIEW_HEIGHT > height * CAMERA_PREVIEW_WIDTH
+-                                        ? height
+-                                        : width * CAMERA_PREVIEW_HEIGHT / CAMERA_PREVIEW_WIDTH;
+-    const uint32_t x_origin       = (width - crop_width) / 2;
+-    const uint32_t y_origin       = (height - crop_height) / 2;
++    /* Rotate only the camera source clockwise before landscape centre-crop
++     * and the existing logical horizontal mirror. Sampling, WB, overlays and
++     * LVGL's display/text rotation remain downstream and unchanged. */
+     const uint16_t* sensor_pixels = (const uint16_t*)image;
+     for (uint32_t y = 0; y < CAMERA_PREVIEW_HEIGHT; ++y) {
+-        const uint32_t sy = y_origin + y * crop_height / CAMERA_PREVIEW_HEIGHT;
+         uint8_t* dst      = preview_image + y * CAMERA_PREVIEW_WIDTH * RGB_BYTES;
+         for (uint32_t x = 0; x < CAMERA_PREVIEW_WIDTH; ++x) {
+-            const uint32_t column = x * crop_width / CAMERA_PREVIEW_WIDTH;
+-#ifdef ALIF_CAMERA_APPKIT
+-            const uint32_t sx = x_origin + column;
+-#else
+-            const uint32_t sx = x_origin + crop_width - 1 - column;
+-#endif
++            const uint32_t source_index = cube_camera_source_index(width, height,
++                CAMERA_PREVIEW_WIDTH, CAMERA_PREVIEW_HEIGHT, x, y);
+             if (pixel_bytes == RGB_BYTES) {
+-                const uint8_t* src = image + (sy * width + sx) * RGB_BYTES;
++                const uint8_t* src = image + source_index * RGB_BYTES;
+                 *dst++             = src[2];
+                 *dst++             = src[1];
+                 *dst++             = src[0];
+                 continue;
+             }
+-            const uint16_t pixel = sensor_pixels[sy * width + sx];
++            const uint16_t pixel = sensor_pixels[source_index];
+             const uint8_t blue   = pixel & 0x1f;
+             const uint8_t green  = (pixel >> 5) & 0x3f;
+             const uint8_t red    = (pixel >> 11) & 0x1f;
+@@ -266,10 +357,63 @@ void camera_update_preview(const uint8_t* image,
+             *dst++               = (red << 3) | (red >> 2);
+         }
+     }
++    /* Keep the accepted any-button/calibration state machine alive.  CAL
++     * retains its fixed white-cross guide.  READ defers colour sampling to the
++     * decoded detector ROI below, rather than claiming this centre guide is a
++     * face ROI. */
++    const uint32_t now_ms = Get_SysTick_Count();
++    const uint32_t request = cube_button_request(now_ms);
++    if (!cube_read_diagnostics.mode || request) {
++        cube_preview_read_and_draw(preview_image, CAMERA_PREVIEW_WIDTH,
++                                   CAMERA_PREVIEW_HEIGHT, cube_face_letters,
++                                   &cube_read_diagnostics, now_ms, request);
++    }
++    /* CAL reads the unmodified preview above, preserving its accepted button
++     * and white-cross state machine.  WB is display-only and occurs after it. */
++    cube_white_balance_preview();
+     /* Keep the full-panel source coherent for the display/DAVE2D reader. */
+     SCB_CleanDCache_by_Addr((uint32_t*)preview_image, sizeof preview_image);
+ }
+ 
++const char* hal_camera_cube_status(void)
++{
++    return cube_calibration_status();
++}
++
++bool hal_camera_cube_is_read_mode(void)
++{
++    return cube_read_diagnostics.mode != 0;
++}
++
++bool hal_camera_cube_read_selected_roi(const uint8_t* rgb, uint32_t frame_width,
++                                       uint32_t frame_height, int32_t x0,
++                                       int32_t y0, int32_t width, int32_t height,
++                                       char letters[10])
++{
++    memset(letters, 0, 10);
++    if (!rgb || !cube_read_diagnostics.mode ||
++        !cube_roi_is_valid(frame_width, frame_height, x0, y0, width, height)) {
++        return false;
++    }
++    /* Map only the selected 192px-model ROI into the existing 240px reader.
++     * RGB model input becomes BGR because cube_preview samples LVGL order. */
++    for (uint32_t y = 0; y < 240; ++y) {
++        for (uint32_t x = 0; x < 240; ++x) {
++            /* UI columns follow model rows and UI rows follow model columns,
++             * matching the clockwise-camera landscape preview transform. */
++            const uint8_t* source = rgb + cube_roi_source_index(
++                frame_width, x0, y0, width, height, y, x) * RGB_BYTES;
++            uint8_t* destination = cube_face_roi_tile + (y * 240 + x) * RGB_BYTES;
++            destination[0] = source[2];
++            destination[1] = source[1];
++            destination[2] = source[0];
++        }
++    }
++    cube_preview_read_and_draw(cube_face_roi_tile, 240, 240, letters,
++                               &cube_read_diagnostics, Get_SysTick_Count(), 0);
++    return true;
++}
++
+ const uint8_t* hal_camera_get_captured_frame(uint32_t* size)
+ {
+     const uint8_t* buffer = NULL;
+diff --git a/source/hal/source/components/lvgl_port/source/alif/include/lv_conf.h b/source/hal/source/components/lvgl_port/source/alif/include/lv_conf.h
+index 4653c80a..6400b1e6 100644
+--- a/source/hal/source/components/lvgl_port/source/alif/include/lv_conf.h
++++ b/source/hal/source/components/lvgl_port/source/alif/include/lv_conf.h
+@@ -327,7 +327,7 @@
+ #endif
+ 
+ /** Use Renesas Dave2D on RA  platforms. */
+-#define LV_USE_DRAW_DAVE2D 1
++#define LV_USE_DRAW_DAVE2D 0
+ 
+ /** Draw using cached SDL textures*/
+ #define LV_USE_DRAW_SDL 0
+diff --git a/source/hal/source/components/npu/CMakeLists.txt b/source/hal/source/components/npu/CMakeLists.txt
+index 6a51c41e..67056b63 100644
+--- a/source/hal/source/components/npu/CMakeLists.txt
++++ b/source/hal/source/components/npu/CMakeLists.txt
+@@ -142,10 +142,10 @@ endif()
+ # maximum burst length for all NPU configurations.
+ if (ETHOS_U_NPU_ID STREQUAL U55 OR ETHOS_U_NPU_ID STREQUAL U65)
+     target_compile_definitions(ethosu_core_driver PRIVATE
+-        AXI_LIMIT0_MAX_BEATS_BYTES=1
+-        AXI_LIMIT1_MAX_BEATS_BYTES=1
+-        AXI_LIMIT2_MAX_BEATS_BYTES=1
+-        AXI_LIMIT3_MAX_BEATS_BYTES=1) # 0 = 64 byte burst & 1 = 128 byte burst
++        AXI_LIMIT0_MAX_BEATS_BYTES=0
++        AXI_LIMIT1_MAX_BEATS_BYTES=0
++        AXI_LIMIT2_MAX_BEATS_BYTES=0
++        AXI_LIMIT3_MAX_BEATS_BYTES=0) # 0 = 64 byte burst & 1 = 128 byte burst
+     # Use "normal" (modifiable) transactions, improving interconnect transit
+     target_compile_definitions(ethosu_core_driver PRIVATE
+         AXI_LIMIT0_MEM_TYPE=2
+diff --git a/source/hal/source/components/npu/ethosu_cpu_cache.c b/source/hal/source/components/npu/ethosu_cpu_cache.c
+index 5dd51fd1..0b3e4545 100644
+--- a/source/hal/source/components/npu/ethosu_cpu_cache.c
++++ b/source/hal/source/components/npu/ethosu_cpu_cache.c
+@@ -27,6 +27,7 @@
+  * limitations under the License.
+  */
+ 
++#include <stdint.h>
+ #include "ethosu_cpu_cache.h"
+ 
+ #include "RTE_Components.h"         /* For CPU related defintiions */
+@@ -68,27 +69,15 @@ void ethosu_flush_dcache(const uint64_t *base_addr, const size_t *base_addr_size
+     }
+ 
+     if (need_flush) {
+-
+-        /**
+-         * @note We could choose to call the `SCB_CleanDCache_by_Addr` function
+-         *       here, but the sizes which this function is called for, can
+-         *       cause unnecessary delays. It's worth noting that this function
+-         *       is called from the Arm Ethos-U NPU drive repeatedly for each
+-         *       region it accesses. This could even be RO memory which does
+-         *       not need cache maintenance, along with parts of the input and
+-         *       output tensors which rightly need to be cleaned. Therefore, to
+-         *       reduce overhead of repeated calls for large memory sizes, we
+-         *       call the clean and invalidation functions for whole cache.
+-         *
+-         *       If the neural network to be executed is completely falling
+-         *       onto the NPU, consider disabling the data cache altogether
+-         *       for the duration of the inference to further reduce the cache
+-         *       maintenance burden in these functions.
+-         */
+-
+-        /** Clean the cache */
+-        trace("Cleaning data cache\n");
+-        SCB_CleanDCache();
++        /* arc-fdo1 2026-10-18: clean only the regions the driver names.  A whole-cache clean
++         * runs a long interruptible set/way loop over every cacheable buffer in the system,
++         * including the LVGL framebuffer rows written from the LCD tear interrupt. */
++        for (int i = 0; i < num_base_addr; i++) {
++            uint32_t *p = (uint32_t *)(uintptr_t)base_addr[i];
++            if (p && base_addr_size[i] && ethosu_area_needs_flush_dcache(p, base_addr_size[i])) {
++                SCB_CleanDCache_by_Addr(p, (int32_t)base_addr_size[i]);
++            }
++        }
+     } else {
+         __DSB();
+     }
+@@ -105,14 +94,12 @@ void ethosu_invalidate_dcache(const uint64_t *base_addr, const size_t *base_addr
+     }
+ 
+     if (need_flush) {
+-        /**
+-         * See note in ethosu_flush_dcache function for why we clean the whole
+-         * cache instead of calling it for specific addresses.
+-         **/
+-        trace("Invalidating data cache\n");
+-        /* Not safe to simply invalidate without cleaning unless we know there are no write-back areas in the system */
+-        SCB_CleanInvalidateDCache();
+-
++        for (int i = 0; i < num_base_addr; i++) {
++            uint32_t *p = (uint32_t *)(uintptr_t)base_addr[i];
++            if (p && base_addr_size[i] && ethosu_area_needs_invalidate_dcache(p, base_addr_size[i])) {
++                SCB_InvalidateDCache_by_Addr(p, (int32_t)base_addr_size[i]);
++            }
++        }
+     } else {
+         __DSB();
+     }
+diff --git a/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.c b/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.c
+index bbb19e0b..001188c9 100644
+--- a/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.c
++++ b/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.c
+@@ -23,12 +23,27 @@
+ 
+ extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_JOY_SW_D_GPIO_PORT);
+ extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_JOY_SW_CENTER_GPIO_PORT);
++extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_JOY_SW_A_GPIO_PORT);
++extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_JOY_SW_B_GPIO_PORT);
++extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_JOY_SW_C_GPIO_PORT);
+ extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_LEDRGB0_R_GPIO_PORT);
+ extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(LED_G_PORT);
+ #ifdef GPIO_PROFILING
+ extern ARM_DRIVER_GPIO ARM_Driver_GPIO_(BOARD_LEDRGB0_B_GPIO_PORT);
+ #endif
+ 
++static ARM_DRIVER_GPIO *const joystick_gpio[5] = {
++    &ARM_Driver_GPIO_(BOARD_JOY_SW_A_GPIO_PORT),
++    &ARM_Driver_GPIO_(BOARD_JOY_SW_B_GPIO_PORT),
++    &ARM_Driver_GPIO_(BOARD_JOY_SW_C_GPIO_PORT),
++    &ARM_Driver_GPIO_(BOARD_JOY_SW_D_GPIO_PORT),
++    &ARM_Driver_GPIO_(BOARD_JOY_SW_CENTER_GPIO_PORT)
++};
++static const uint32_t joystick_pin[5] = {
++    BOARD_JOY_SW_A_GPIO_PIN, BOARD_JOY_SW_B_GPIO_PIN, BOARD_JOY_SW_C_GPIO_PIN,
++    BOARD_JOY_SW_D_GPIO_PIN, BOARD_JOY_SW_CENTER_GPIO_PIN
++};
++
+ void BOARD_UTILS_Init()
+ {
+     ARM_DRIVER_GPIO *BOARD_BUTTON1_GPIOdrv = &ARM_Driver_GPIO_(BOARD_JOY_SW_D_GPIO_PORT);
+@@ -47,6 +62,14 @@ void BOARD_UTILS_Init()
+     BOARD_BUTTON2_GPIOdrv->PowerControl(BOARD_JOY_SW_CENTER_GPIO_PIN, ARM_POWER_FULL);
+     BOARD_BUTTON2_GPIOdrv->SetDirection(BOARD_JOY_SW_CENTER_GPIO_PIN, GPIO_PIN_DIRECTION_INPUT);
+ 
++    /* D/CENTER retain their existing initialization and public button APIs.
++     * Initialize the other three contacts using the board's own pin IDs. */
++    for (unsigned i = 0; i < 3; ++i) {
++        joystick_gpio[i]->Initialize(joystick_pin[i], NULL);
++        joystick_gpio[i]->PowerControl(joystick_pin[i], ARM_POWER_FULL);
++        joystick_gpio[i]->SetDirection(joystick_pin[i], GPIO_PIN_DIRECTION_INPUT);
++    }
++
+ #ifdef GPIO_PROFILING
+     BOARD_LED1_BLUE_GPIOdrv->Initialize(BOARD_LEDRGB0_B_GPIO_PIN, NULL);
+     BOARD_LED1_BLUE_GPIOdrv->PowerControl(BOARD_LEDRGB0_B_GPIO_PIN, ARM_POWER_FULL);
+@@ -71,6 +94,17 @@ void BOARD_BUTTON1_Init(BOARD_Callback_t user_cb)
+ 	BOARD_BUTTON1_GPIOdrv->Initialize(BOARD_JOY_SW_D_GPIO_PIN, (ARM_GPIO_SignalEvent_t)user_cb);
+ }
+ 
++uint32_t BOARD_JOYSTICK_GetPressedMask(void)
++{
++    uint32_t mask = 0;
++    for (unsigned i = 0; i < 5; ++i) {
++        uint32_t value = BOARD_BUTTON_STATE_HIGH;
++        if (joystick_gpio[i]->GetValue(joystick_pin[i], &value) == ARM_DRIVER_OK &&
++            value == BOARD_BUTTON_STATE_LOW) mask |= 1u << i;
++    }
++    return mask;
++}
++
+ void BOARD_BUTTON2_Init(BOARD_Callback_t user_cb)
+ {
+ 	ARM_DRIVER_GPIO *BOARD_BUTTON2_GPIOdrv = &ARM_Driver_GPIO_(BOARD_JOY_SW_CENTER_GPIO_PORT);
+diff --git a/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.h b/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.h
+index 9c459ee9..eb240a13 100644
+--- a/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.h
++++ b/source/hal/source/platform/alif/cmsis-pack/Boards/utils/board_utils.h
+@@ -42,6 +42,8 @@ void BOARD_BUTTON1_Control(BOARD_BUTTON_CONTROL control);
+ void BOARD_BUTTON2_Control(BOARD_BUTTON_CONTROL control);
+ void BOARD_BUTTON1_GetState(BOARD_BUTTON_STATE *state);
+ void BOARD_BUTTON2_GetState(BOARD_BUTTON_STATE *state);
++/* Active-low joystick contacts A,B,C,D,CENTER in bits 0..4; excludes reset/power. */
++uint32_t BOARD_JOYSTICK_GetPressedMask(void);
+ void BOARD_LED1_Control(BOARD_LED_STATE state);
+ void BOARD_LED2_Control(BOARD_LED_STATE state);
+ #ifdef GPIO_PROFILING
+diff --git a/source/hal/source/platform/alif/source/platform_drivers.c b/source/hal/source/platform/alif/source/platform_drivers.c
+index 86d7ea74..eb95a4e1 100644
+--- a/source/hal/source/platform/alif/source/platform_drivers.c
++++ b/source/hal/source/platform/alif/source/platform_drivers.c
+@@ -1,6 +1,6 @@
+ /* This file was ported to work on Alif Semiconductor devices. */
+ 
+-/* Copyright (C) 2022-2024 Alif Semiconductor - All Rights Reserved.
++/* Copyright (C) 2022-2024, 2026 Alif Semiconductor - All Rights Reserved.
+  * Use, distribution and modification of this code is permitted under the
+  * terms stated in the Alif Semiconductor Software License Agreement
+  *
+@@ -11,7 +11,7 @@
+  */
+ 
+ /*
+- * Copyright (c) 2022 Arm Limited. All rights reserved.
++ * Copyright (c) 2022, 2026 Arm Limited. All rights reserved.
+  * SPDX-License-Identifier: Apache-2.0
+  *
+  * Licensed under the Apache License, Version 2.0 (the "License");
+@@ -517,10 +517,10 @@ int platform_init(void)
+ #endif
+ 
+ #if defined(ARM_NPU)
+-
+     int state;
+ 
+-    /* If Arm Ethos-U NPU is to be used, we initialise it here */
++    /* The face ROI is provided by the Ethos-U model before CPU colour
++     * sampling, so initialise and prioritize the NPU normally. */
+     if (0 != (state = arm_ethosu_npu_init())) {
+         return state;
+     }
+diff --git a/source/lib/mlek/fwk/tflm/CMakeLists.txt b/source/lib/mlek/fwk/tflm/CMakeLists.txt
+index 76fb8287..e8ad65ec 100644
+--- a/source/lib/mlek/fwk/tflm/CMakeLists.txt
++++ b/source/lib/mlek/fwk/tflm/CMakeLists.txt
+@@ -69,6 +69,14 @@ target_link_libraries(${ML_FWK_TFLM_TARGET} PUBLIC
+ 
+ target_compile_definitions(${ML_FWK_TFLM_TARGET} INTERFACE MLEK_FWK_TFLM=1)
+ 
++# The model wrappers select their CPU fallback operators at compile time.  An
++# assumed Ethos-U configuration must reach this library as well as the UI
++# target; otherwise the resolver retains unused Conv/Pad/Pool kernels and can
++# exceed its fixed operation capacity before registering Ethos-U.
++if (ETHOS_U_NPU_ASSUMED)
++    target_compile_definitions(${ML_FWK_TFLM_TARGET} PRIVATE ETHOS_U_NPU_ASSUMED=1)
++endif()
++
+ # Set the source file property to indicate that it should not use the logging
+ # facility from the Cortex-M CPU generic target unless it is an internally
+ # configured target. Reason: for external target, we can't assume that it
+diff --git a/source/lib/mlek/fwk/tflm/YoloFastestModel.cc b/source/lib/mlek/fwk/tflm/YoloFastestModel.cc
+index f5fc36bf..52a93b65 100644
+--- a/source/lib/mlek/fwk/tflm/YoloFastestModel.cc
++++ b/source/lib/mlek/fwk/tflm/YoloFastestModel.cc
+@@ -25,6 +25,10 @@ const tflite::MicroOpResolver& arm::app::fwk::tflm::YoloFastestModel::GetOpResol
+ 
+ bool arm::app::fwk::tflm::YoloFastestModel::EnlistOperations()
+ {
++    /* Vela keeps float input/output boundary conversions on the CPU for the
++     * cube-face YOLOv8 model; the convolution graph is delegated as ethos-u. */
++    this->m_opResolver.AddQuantize();
++    this->m_opResolver.AddDequantize();
+ #ifndef ETHOS_U_NPU_ASSUMED
+     this->m_opResolver.AddDepthwiseConv2D();
+     this->m_opResolver.AddConv2D();
+diff --git a/source/lib/mlek/fwk/tflm/YoloFastestModel.hpp b/source/lib/mlek/fwk/tflm/YoloFastestModel.hpp
+index cc582736..908ff31e 100644
+--- a/source/lib/mlek/fwk/tflm/YoloFastestModel.hpp
++++ b/source/lib/mlek/fwk/tflm/YoloFastestModel.hpp
+@@ -48,7 +48,7 @@ protected:
+ 
+ private:
+     /* Maximum number of individual operations that can be enlisted. */
+-    static constexpr int ms_maxOpCnt = 8;
++    static constexpr int ms_maxOpCnt = 10;
+ 
+     /* A mutable op resolver instance. */
+     tflite::MicroMutableOpResolver<ms_maxOpCnt> m_opResolver;
+diff --git a/tests/cube_cross_hint_test.c b/tests/cube_cross_hint_test.c
+new file mode 100644
+index 00000000..46257830
+--- /dev/null
++++ b/tests/cube_cross_hint_test.c
+@@ -0,0 +1,30 @@
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "cube_cross_hint.h"
++
++static int hint(const char *face, char *out) { return cube_cross_hint(face, out, CUBE_CROSS_HINT_LEN); }
++
++int main(void)
++{
++    char out[CUBE_CROSS_HINT_LEN];
++    assert(hint("WWWWWWWWW", out) == 4 && strstr(out, "4/4"));
++    assert(hint("RWBWWGOYW", out) == 2 && strstr(out, "2/4"));           /* two white edges on top */
++    assert(hint("?????????", out) == -1 && strstr(out, "SHOW ONE FACE"));
++    assert(hint("YWYYYYYWY", out) == 2 && strstr(out, "BOTTOM") && strstr(out, "TWICE"));
++    assert(hint("YYYYYYYYY", out) == 0 && strstr(out, "NO WHITE EDGE"));
++    assert(hint("BBBBBBBBB", out) == 0 && strstr(out, "blue EDGE ALIGNED"));
++    assert(hint("BWBBBBBBB", out) == 1 && strstr(out, "FLIPPED"));
++    assert(hint("BGBBBBBBB", out) == 0 && strstr(out, "TOP EDGE ABOVE blue IS green"));
++    assert(hint("BGBWBBBBB", out) == 1 && strstr(out, "MIDDLE LAYER"));
++    assert(hint("BGBBBBBWB", out) == 1 && strstr(out, "AT BOTTOM OF blue"));
++    assert(hint("B?BBBBBBB", out) == 0 && strstr(out, "UNCLEAR"));
++    /* Every line fits the label buffer with its terminator. */
++    const char *faces[] = {"WWWWWWWWW", "RWBWWGOYW", "YWYYYYYWY", "BWBBBBBBB", "BGBWBBBBB", "BGBBBBBWB"};
++    for (unsigned i = 0; i < sizeof faces / sizeof *faces; ++i) {
++        hint(faces[i], out);
++        assert(strlen(out) < CUBE_CROSS_HINT_LEN);
++    }
++    puts("PASS single-face white-cross hint: top, bottom, side aligned/flipped/middle/bottom, unsure");
++    return 0;
++}
+diff --git a/tests/cube_face_multi_select_test.cpp b/tests/cube_face_multi_select_test.cpp
+new file mode 100644
+index 00000000..5e28ffb5
+--- /dev/null
++++ b/tests/cube_face_multi_select_test.cpp
+@@ -0,0 +1,37 @@
++#include "CubeFaceMultiSelect.hpp"
++
++#include <array>
++#include <cassert>
++
++int main()
++{
++    constexpr size_t channels = 5, candidates = 756;
++    std::array<float, channels * candidates> output{};
++    const auto set = [&](size_t c, float x, float y, float w, float h, float conf) {
++        output[0 * candidates + c] = x; output[1 * candidates + c] = y;
++        output[2 * candidates + c] = w; output[3 * candidates + c] = h; output[4 * candidates + c] = conf;
++    };
++    const auto valueAt = [&](size_t index) { return output[index]; };
++    size_t selected[3];
++    /* Two faces apart, a near-duplicate of the first, one bright sticker, one weak box. */
++    set(10, 0.30f, 0.50f, 0.30f, 0.30f, 0.60f);   /* face A, area 0.09 */
++    set(11, 0.31f, 0.50f, 0.30f, 0.30f, 0.55f);   /* duplicate of A, IoU ~0.94 */
++    set(20, 0.75f, 0.50f, 0.40f, 0.40f, 0.40f);   /* face B, area 0.16 (largest) */
++    set(30, 0.50f, 0.20f, 0.17f, 0.16f, 0.999f);  /* sticker, area 0.027 */
++    set(40, 0.50f, 0.80f, 0.30f, 0.30f, 0.10f);   /* below threshold */
++    size_t n = alif::app::object_detection::SelectCubeFaces(valueAt, candidates, 0.25f, 0.04f, 0.5f, 3, selected);
++    assert(n == 2);
++    assert(selected[0] == 20 && selected[1] == 10);  /* largest first, duplicate and sticker gone */
++    /* Four faces: at most three, largest first. */
++    set(50, 0.20f, 0.20f, 0.25f, 0.25f, 0.50f);
++    set(60, 0.80f, 0.85f, 0.20f, 0.20f, 0.50f);
++    n = alif::app::object_detection::SelectCubeFaces(valueAt, candidates, 0.25f, 0.04f, 0.5f, 3, selected);
++    assert(n == 3 && selected[0] == 20 && selected[1] == 10 && selected[2] == 50);
++    /* Single-face scene unchanged: one result. */
++    std::array<float, channels * candidates> single{};
++    single[2 * candidates + 5] = 0.4f; single[3 * candidates + 5] = 0.4f; single[4 * candidates + 5] = 0.9f;
++    const auto one = [&](size_t index) { return single[index]; };
++    n = alif::app::object_detection::SelectCubeFaces(one, candidates, 0.25f, 0.04f, 0.5f, 3, selected);
++    assert(n == 1 && selected[0] == 5);
++    return 0;
++}
+diff --git a/tests/cube_face_yolov8_decoder_test.cpp b/tests/cube_face_yolov8_decoder_test.cpp
+new file mode 100644
+index 00000000..05289e29
+--- /dev/null
++++ b/tests/cube_face_yolov8_decoder_test.cpp
+@@ -0,0 +1,28 @@
++#include "CubeFaceYoloV8.hpp"
++
++#include <array>
++#include <cassert>
++
++int main()
++{
++    constexpr size_t channels = 5;
++    constexpr size_t candidates = 756;
++    std::array<float, channels * candidates> output{};
++    const auto set = [&](size_t channel, size_t candidate, float value) {
++        output[channel * candidates + candidate] = value;
++    };
++    /* A bright sticker may score higher than the complete cube face. */
++    set(2, 200, 0.17f);
++    set(3, 200, 0.16f);
++    set(4, 200, 0.999f);
++    set(2, 642, 0.48f);
++    set(3, 642, 0.48f);
++    set(4, 642, 0.326f);
++
++    const auto valueAt = [&](size_t index) { return output[index]; };
++    assert(alif::app::object_detection::SelectLargestFaceCandidate(
++                   valueAt, candidates, 0.25f) == 642);
++    assert(alif::app::object_detection::SelectLargestFaceCandidate(
++                   valueAt, candidates, 1.0f) == candidates);
++    return 0;
++}
+diff --git a/tests/cube_preview/test_button_actions.c b/tests/cube_preview/test_button_actions.c
+new file mode 100644
+index 00000000..bf9802e1
+--- /dev/null
++++ b/tests/cube_preview/test_button_actions.c
+@@ -0,0 +1,50 @@
++#include <assert.h>
++#include <stdio.h>
++#include "cube_button_actions.h"
++
++static void short_press(cube_button_state *s, unsigned mask, unsigned now, unsigned mode)
++{
++    assert(cube_button_action(s, mask, now, mode) == 0);
++    assert(cube_button_action(s, mask, now + 50, mode) == 0);
++    assert(cube_button_action(s, mask, now + 500, mode) == 0);
++    assert(cube_button_action(s, 0, now + 550, mode) == 0);
++    assert(cube_button_action(s, 0, now + 600, mode) == (mode ? 2u : 1u));
++    assert(cube_button_action(s, 0, now + 800, mode) == 0);
++}
++int main(void)
++{
++    for (unsigned button = 0; button < 5; ++button) {
++        cube_button_state s = {0};
++        short_press(&s, 1u << button, 100, 1); /* READ -> CAL. */
++        short_press(&s, 1u << button, 1100, 0); /* CAL -> validated lock request. */
++    }
++    cube_button_state s = {0};
++    assert(cube_button_action(&s, 1, 100, 1) == 0);
++    assert(cube_button_action(&s, 1, 150, 1) == 0);
++    assert(cube_button_action(&s, 3, 500, 1) == 0); /* Chord does not re-arm. */
++    assert(cube_button_action(&s, 2, 700, 1) == 0); /* First button released. */
++    assert(cube_button_action(&s, 0, 800, 1) == 0);
++    assert(cube_button_action(&s, 0, 850, 1) == 2);
++    assert(cube_button_action(&s, 0, 900, 0) == 0); /* No double transition. */
++    short_press(&s, 31, 1000, 0); /* All-five chord: one lock request. */
++    s = (cube_button_state){0};
++    assert(cube_button_action(&s, 4, 100, 1) == 0);
++    assert(cube_button_action(&s, 0, 120, 1) == 0);
++    assert(cube_button_action(&s, 0, 200, 1) == 0); /* Bounce ignored. */
++    assert(cube_button_action(&s, 4, 300, 1) == 0);
++    assert(cube_button_action(&s, 4, 350, 1) == 0);
++    assert(cube_button_action(&s, 4, 1850, 1) == 2);
++    assert(cube_button_action(&s, 12, 2200, 0) == 0);
++    assert(cube_button_action(&s, 0, 2300, 0) == 0);
++    assert(cube_button_action(&s, 0, 2350, 0) == 0); /* Long release cannot lock. */
++    short_press(&s, 16, 2500, 0);
++    s = (cube_button_state){0};
++    assert(cube_button_action(&s, 1, 100, 1) == 0);
++    assert(cube_button_action(&s, 1, 150, 1) == 0);
++    assert(cube_button_action(&s, 0, 200, 1) == 0);
++    assert(cube_button_action(&s, 2, 220, 1) == 0); /* Not fully released for50ms. */
++    assert(cube_button_action(&s, 2, 300, 1) == 0);
++    assert(cube_button_action(&s, 0, 400, 1) == 0);
++    assert(cube_button_action(&s, 0, 450, 1) == 2);
++    puts("PASS five buttons, held/chord, debounce/release, long-hold one-shot");
++}
+diff --git a/tests/cube_preview/test_camera_mapping.c b/tests/cube_preview/test_camera_mapping.c
+new file mode 100644
+index 00000000..9f254d48
+--- /dev/null
++++ b/tests/cube_preview/test_camera_mapping.c
+@@ -0,0 +1,38 @@
++#include <assert.h>
++#include <math.h>
++#include <stdio.h>
++#include "cube_camera_mapping.h"
++
++int main(void)
++{
++    /* Asymmetric sensor ABC/DEF -> clockwise DA/EB/FC -> mirror AD/BE/CF.
++     * Every output row and all four corners are distinct. */
++    const unsigned expected[6] = {0, 3, 1, 4, 2, 5};
++    const unsigned old_mirror_only[6] = {2, 1, 0, 5, 4, 3};
++    unsigned differs = 0;
++    for (unsigned y = 0; y < 3; ++y)
++        for (unsigned x = 0; x < 2; ++x) {
++            unsigned index = cube_camera_source_index(3, 2, 2, 3, x, y);
++            assert(index == expected[y * 2 + x]);
++            differs += index != old_mirror_only[y * 2 + x];
++        }
++    assert(differs > 0); /* Deleting the rotation must fail the exact mapping. */
++    /* Native 8x6 -> rotated6x8 -> central6x3 crop -> landscape8x4.
++     * Literal indices independently encode clockwise source rows and crop. */
++    const unsigned crop_expected[4][8] = {
++        {2,2,10,18,26,26,34,42}, {2,2,10,18,26,26,34,42},
++        {3,3,11,19,27,27,35,43}, {4,4,12,20,28,28,36,44}
++    };
++    for (unsigned y = 0; y < 4; ++y)
++        for (unsigned x = 0; x < 8; ++x)
++            assert(cube_camera_source_index(8, 6, 8, 4, x, y) == crop_expected[y][x]);
++    /* An off-centre model rect maps through the same rotate/crop/mirror
++     * transform: source x/y become logical y/x respectively. */
++    cube_camera_point first = cube_camera_model_to_preview(480, 480, 800, 480,
++                                                             192, 192, 48, 24);
++    cube_camera_point last = cube_camera_model_to_preview(480, 480, 800, 480,
++                                                            192, 192, 108, 54);
++    assert(fabsf(first.x - 100) < 0.01f && fabsf(first.y - 40) < 0.01f);
++    assert(fabsf(last.x - 225) < 0.01f && fabsf(last.y - 290) < 0.01f);
++    puts("PASS clockwise camera + crop/mirror + off-centre model-to-preview box");
++}
+diff --git a/tests/cube_preview/test_cube_preview.c b/tests/cube_preview/test_cube_preview.c
+new file mode 100644
+index 00000000..488222f3
+--- /dev/null
++++ b/tests/cube_preview/test_cube_preview.c
+@@ -0,0 +1,73 @@
++#include <assert.h>
++#include <stddef.h>
++#include <stdio.h>
++#include <string.h>
++#define RTE_PANEL_HACTIVE_TIME 480
++#define RTE_PANEL_VACTIVE_LINE 800
++#include "cube_display_geometry.h"
++#include "cube_preview.h"
++
++static uint8_t image[CUBE_PREVIEW_WIDTH * CUBE_PREVIEW_HEIGHT * 3];
++static void fill_cell(unsigned cell, unsigned r, unsigned g, unsigned b)
++{
++    unsigned x0 = (CUBE_PREVIEW_WIDTH - 240) / 2 + cell % 3 * 80;
++    unsigned y0 = (CUBE_PREVIEW_HEIGHT - 240) / 2 + cell / 3 * 80;
++    for (unsigned y = y0; y < y0 + 80; ++y)
++        for (unsigned x = x0; x < x0 + 80; ++x) {
++            uint8_t *p = image + (y * CUBE_PREVIEW_WIDTH + x) * 3;
++            p[0] = b; p[1] = g; p[2] = r;
++        }
++}
++static void white_cross(void)
++{
++    memset(image, 128, sizeof image);
++    for (unsigned cell = 0; cell < 9; ++cell) fill_cell(cell, 180, 200, 220);
++    fill_cell(0, 200, 30, 40); fill_cell(2, 40, 170, 70);
++    fill_cell(6, 30, 80, 200); fill_cell(8, 240, 120, 30);
++    fill_cell(4, 30, 80, 200);
++}
++static void read_frame(cube_diagnostics *d, char letters[10], uint32_t request)
++{
++    cube_preview_read_and_draw(image, CUBE_PREVIEW_WIDTH, CUBE_PREVIEW_HEIGHT,
++                              letters, d, 100, request);
++}
++int main(void)
++{
++    cube_diagnostics d = {.mode = 1};
++    char letters[10];
++    white_cross(); read_frame(&d, letters, 0);
++    assert(d.mode == 1 && !d.white_valid); /* Boot must not auto-lock. */
++    white_cross(); read_frame(&d, letters, 2);
++    assert(d.mode == 0 && d.cross_valid && d.reference_mask == 0xAA);
++    assert(d.candidate_rgb[0] == 180 && d.candidate_rgb[1] == 200);
++    white_cross(); read_frame(&d, letters, 1);
++    assert(d.white_valid && d.logo_ref_valid && d.mode == 1);
++    assert(d.white_success_count == 1 && d.white_ref[0] == 180);
++    assert(d.logo_ref_raw[0] == 30 && d.logo_ref_raw[1] == 80);
++    assert(fabsf(d.logo_ref_rgb[0] - 30 * 235.0f / 180) < 0.001f);
++    white_cross(); read_frame(&d, letters, 0);
++    assert(letters[6] == 'W' && (d.logo_mask & (1u << 6)));
++    white_cross(); fill_cell(6, 20, 40, 240); read_frame(&d, letters, 0);
++    assert(letters[6] == 'B' && !(d.logo_mask & (1u << 6)));
++    white_cross(); fill_cell(4, 180, 200, 220);
++    unsigned cx = CUBE_PREVIEW_WIDTH / 2, cy = CUBE_PREVIEW_HEIGHT / 2;
++    for (unsigned y = cy - 5; y < cy + 5; ++y)
++        for (unsigned x = cx - 5; x < cx + 5; ++x) {
++            uint8_t *p = image + (y * CUBE_PREVIEW_WIDTH + x) * 3;
++            p[0] = 200; p[1] = 80; p[2] = 30;
++        }
++    read_frame(&d, letters, 0);
++    assert(d.raw_rgb[4][0] == 180 && d.raw_rgb[4][1] == 200);
++    assert(image[0] != 128); /* Gains visibly transform preview pixels. */
++    white_cross(); fill_cell(1, 200, 30, 40); read_frame(&d, letters, 2);
++    assert(d.mode == 0 && !d.cross_valid && !d.logo_ref_valid);
++    white_cross(); fill_cell(1, 200, 30, 40); read_frame(&d, letters, 1);
++    assert(d.mode == 0 && !d.white_valid && d.lock_rejected);
++    white_cross(); read_frame(&d, letters, 1);
++    assert(d.mode == 1 && d.white_valid && !d.lock_rejected);
++    assert(sizeof(cube_diagnostics) == 736 && offsetof(cube_diagnostics, logo_ref_raw) == 592);
++    assert(CUBE_STATUS_Y > (CUBE_PREVIEW_HEIGHT + 240) / 2);
++    assert(CUBE_STATUS_Y + 80 <= CUBE_PREVIEW_HEIGHT);
++    printf("PASS rotation=%d canvas=%dx%d white-cross/logo/reject/relock/visible-WB\n",
++           CUBE_DISPLAY_ROTATION, CUBE_PREVIEW_WIDTH, CUBE_PREVIEW_HEIGHT);
++}
+diff --git a/tests/cube_preview/test_neutral_white.c b/tests/cube_preview/test_neutral_white.c
+new file mode 100644
+index 00000000..8d76bd3f
+--- /dev/null
++++ b/tests/cube_preview/test_neutral_white.c
+@@ -0,0 +1,41 @@
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "cube_preview.h"
++
++static void expect(const float rgb[3], unsigned colour)
++{
++    float hsv[3];
++    assert(cube_hsv_colour(rgb, hsv) == colour);
++}
++static void pipeline(unsigned r, unsigned g, unsigned b, char expected)
++{
++    static uint8_t image[240 * 240 * 3];
++    for (unsigned i = 0; i < 240 * 240; ++i) {
++        image[i * 3] = b; image[i * 3 + 1] = g; image[i * 3 + 2] = r;
++    }
++    cube_diagnostics d = {.mode = 1, .white_valid = 1,
++        .white_ref = {126.8611145f, 137.2430420f, 77.6527786f}};
++    char letters[10];
++    cube_preview_read_and_draw(image, 240, 240, letters, &d, 0, 0);
++    for (unsigned i = 0; i < 9; ++i) assert(letters[i] == expected);
++}
++int main(void)
++{
++    /* Exact archived green-white frame840 corrected RGB; red previously W. */
++    expect((float[3]){167.3609467f,108.9920654f,122.5648422f}, 2);
++    expect((float[3]){85.7001266f,97.9335175f,138.4949036f}, 4);
++    /* Captured dark green is not white; pipeline must continue to ABSTAIN,
++     * not invent a green hue remapping for the blue-shifted measurement. */
++    float hsv[3];
++    assert(cube_hsv_colour((float[3]){94.2418442f,119.1706772f,126.8941269f}, hsv) != 0);
++    expect((float[3]){255,255,255}, 0);
++    expect((float[3]){253.8586578f,255,255}, 0);
++    expect((float[3]){220.4832306f,217.9200745f,222.1361999f}, 0);
++    expect((float[3]){130,180,140}, 5); /* Chromatic green cannot become W. */
++    pipeline(90,64,40,'R'); /* Rounded captured red raw RGB + SAME saved gains. */
++    pipeline(46,57,46,'B');
++    pipeline(51,70,42,'?');
++    pipeline(150,167,95,'W'); /* Clipped-white ambiguity remains, not fixed here. */
++    puts("PASS captured red R, blue B, green uncertain, neutral whites W");
++}
+diff --git a/tests/cube_preview/test_selected_roi.c b/tests/cube_preview/test_selected_roi.c
+new file mode 100644
+index 00000000..bde49172
+--- /dev/null
++++ b/tests/cube_preview/test_selected_roi.c
+@@ -0,0 +1,36 @@
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "cube_preview.h"
++
++static uint8_t model_rgb[24 * 24 * 3];
++static uint8_t roi_bgr[240 * 240 * 3];
++
++int main(void)
++{
++    static const uint8_t rgb[9][3] = {
++        {235,235,235}, {240,220,40}, {200,30,40},
++        {240,120,30}, {30,80,200}, {40,170,70},
++        {200,30,40}, {240,220,40}, {235,235,235},
++    };
++    for (unsigned cell = 0; cell < 9; ++cell)
++        for (unsigned y = 0; y < 6; ++y) for (unsigned x = 0; x < 6; ++x) {
++            uint8_t *pixel = model_rgb + ((3 + cell / 3 * 6 + y) * 24 +
++                                          3 + cell % 3 * 6 + x) * 3;
++            memcpy(pixel, rgb[cell], 3);
++        }
++    assert(cube_roi_is_valid(24, 24, 3, 3, 18, 18));
++    assert(!cube_roi_is_valid(24, 24, 3, 3, 14, 18));
++    for (unsigned y = 0; y < 240; ++y) for (unsigned x = 0; x < 240; ++x) {
++        const uint8_t *source = model_rgb + cube_roi_source_index(24, 3, 3, 18, 18, y, x) * 3;
++        uint8_t *destination = roi_bgr + (y * 240 + x) * 3;
++        destination[0] = source[2]; destination[1] = source[1]; destination[2] = source[0];
++    }
++    cube_diagnostics diagnostics = {.mode = 1, .white_valid = 1,
++                                     .white_ref = {235, 235, 235}};
++    char letters[10];
++    cube_preview_read_and_draw(roi_bgr, 240, 240, letters, &diagnostics, 0, 0);
++    assert(strcmp(letters, "WORYBYRGW") == 0);
++    puts("PASS selected ROI transpose, calibrated colour readout, and invalid/no-detection guard");
++}
+diff --git a/tests/cube_preview/test_table_calibration.c b/tests/cube_preview/test_table_calibration.c
+new file mode 100644
+index 00000000..91c9ba4f
+--- /dev/null
++++ b/tests/cube_preview/test_table_calibration.c
+@@ -0,0 +1,56 @@
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#include "cube_preview.h"
++
++/* Private table-calibration-20261018.LK7u1g, frame 2907.  The constants are
++ * raw patch medians captured before white balancing; they are deliberately
++ * shuffled below so expected labels cannot depend on a grid position. */
++static const float captured_raw[9][3] = {
++    {46.5277786f, 60.9861069f, 34.3333359f}, /* Y */
++    {37.5000000f, 33.6944427f, 26.7500000f}, /* R */
++    {36.3611107f, 34.0972214f, 27.2222214f}, /* R */
++    {25.7222214f, 39.2777786f, 29.1250000f}, /* G */
++    {34.4305573f, 31.1388893f, 25.6250000f}, /* R */
++    {25.5138893f, 32.9583321f, 33.2777786f}, /* B */
++    {34.2222214f, 31.4444447f, 25.5833321f}, /* O: RGB-overlaps red */
++    {34.2777786f, 32.5000000f, 25.8888893f}, /* O: RGB-overlaps red */
++    {43.0000000f, 54.6111107f, 32.6944466f}, /* Y */
++};
++
++static void fill_cell(uint8_t *image, unsigned cell, const float rgb[3])
++{
++    const unsigned x0 = cell % 3 * 80;
++    const unsigned y0 = cell / 3 * 80;
++    for (unsigned y = y0; y < y0 + 80; ++y)
++        for (unsigned x = x0; x < x0 + 80; ++x) {
++            uint8_t *p = image + (y * 240 + x) * 3;
++            p[0] = (uint8_t)(rgb[2] + 0.5f); /* input is B, G, R */
++            p[1] = (uint8_t)(rgb[1] + 0.5f);
++            p[2] = (uint8_t)(rgb[0] + 0.5f);
++        }
++}
++
++int main(void)
++{
++    static uint8_t image[240 * 240 * 3];
++    static const unsigned source_for_cell[9] = {5, 0, 7, 3, 1, 8, 6, 4, 2};
++    /* Orange samples remain R here: their RGB values overlap the confirmed
++     * R sample, so a feature-only reader cannot honestly separate them. */
++    static const char expected[] = "BYRGRYRRR";
++    cube_diagnostics diagnostics = {
++        .mode = 1,
++        .white_valid = 1,
++        .white_ref = {38.9652786f, 54.1666641f, 45.4027786f},
++    };
++    char letters[10];
++
++    for (unsigned cell = 0; cell < 9; ++cell)
++        fill_cell(image, cell, captured_raw[source_for_cell[cell]]);
++
++    cube_preview_read_and_draw(image, 240, 240, letters, &diagnostics, 0, 0);
++    assert(strcmp(letters, expected) == 0);
++    assert(diagnostics.abstain_mask == 0);
++    puts("PASS captured raw calibration: Y/R/G/B recover; red-orange unresolved");
++}
